@@ -1,0 +1,72 @@
+[package]
+name = "ferry-ingest"
+version = "0.1.0-alpha.1"
+edition = "2024"
+rust-version = "1.89"
+description = "Edge agent that ships instrument data from watched folders to one or more S3-compatible stores, on a cron schedule or as it lands"
+license = "Apache-2.0"
+repository = "https://github.com/Rosebud-Biosciences/ferry"
+readme = "README.md"
+keywords = ["s3", "ceph", "ingest", "file-watcher", "object-storage"]
+categories = ["command-line-utilities", "filesystem", "science"]
+
+[lib]
+name = "ferry"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ferry"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+aws-lc-rs = "1"
+async-trait = "0.1"
+bytes = "1"
+bytesize = "2"
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
+clap = { version = "4", features = ["derive", "env"] }
+croner = "4"
+dirs = "6"
+futures = "0.3"
+globset = "0.4"
+hex = "0.4"
+hostname = "0.4"
+humantime = "2"
+notify = "8"
+object_store = { version = "0.14", features = ["aws", "fs"] }
+regex = "1"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+rusqlite = { version = "0.40", features = ["bundled", "backup"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_path_to_error = "0.1"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+url = "2"
+yaml_serde = "0.10"
+
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.8"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+] }
+
+[dev-dependencies]
+assert_cmd = "2"
+filetime = "0.2"
+predicates = "3"
+tempfile = "3"
+tokio = { version = "1", features = ["test-util"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
