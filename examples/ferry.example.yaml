@@ -7,26 +7,36 @@ state_dir: C:/ProgramData/ferry   # journal, logs and lock live here
 
 stores:
   ceph:
-    url: s3://instrument-raw/      # bucket (and optional prefix)
+    url: s3://instrument-raw/      # bucket (and optional key prefix)
     endpoint: https://rgw.lab.internal
     region: default                # SigV4 needs one; RGW accepts its zonegroup name
     # virtual_hosted_style: false  # path-style, which RGW expects, is the default
-    config:                        # passed to obstore's S3Config verbatim
-      access_key_id: ${FERRY_S3_KEY}
-      secret_access_key: ${FERRY_S3_SECRET}
+    options:                       # any object_store S3 setting, by name
+      aws_access_key_id: ${FERRY_S3_KEY}
+      aws_secret_access_key: ${FERRY_S3_SECRET}
     # checksum: sha256             # only where the server validates it (AWS; RGW from Tentacle)
+    bandwidth: {"08:00-18:00": 50MB}   # bytes/s during working hours, unlimited otherwise
   aws:
-    url: s3://my-bucket/
+    url: s3://lab-archive/
     region: us-west-2
-    profile: lab                   # an AWS shared-config profile (pip install 'ferry-ingest[aws]')
+    profile: lab                   # static keys from ~/.aws/credentials; or set AWS_* variables
+  nas:
+    url: //nas01/instrument-backup # a local, mounted or UNC directory works too
 
-sources:
+pipelines:
   # Nightly: every Cytation5 acquisition folder that is complete by 02:00 goes
-  # up whole, is registered, and moves to the backup drive.
+  # up whole to Ceph and to an AWS archive, from one read, is registered, and
+  # moves to the backup drive once both stores hold verified copies.
   - name: workcell1_cytation
     root: C:/Users/Lab/Documents/Data/Cytation5
-    store: ceph
-    prefix: workcell/raw
+    prefix: workcell/raw           # under each destination's url
+    destinations:
+      - ceph                       # shorthand for {store: ceph}
+      - store: aws
+        prefix: cytation5          # its own prefix instead of the pipeline's
+        required: false            # registration does not wait for it (finalize does)
+        verify: sha256             # read each object back and compare hashes
+    fanout: shared                 # one read feeds every destination (or: separate)
     unit: {dirs: "*__*"}           # each matching top-level folder is a unit
     include: ["*.tif"]
     mode: cron
@@ -36,21 +46,27 @@ sources:
     settle: 2m                     # a file is settled once its mtime is this old
     unit_idle: 30m                 # complete once nothing has changed for this long
     finalize:
-      action: move_to_backup       # keep | move_to_backup | delete_after_upload
+      action: move                 # keep | move | delete
       backup_root: F:/Cytation5Raw
       concurrency: 4               # keep low for spinning disks
     limits:
       files_in_flight: 24
-      bandwidth: {"08:00-18:00": 50MB}   # bytes/s during working hours; unlimited otherwise
     registrars:
-      - manifest                   # <unit>/_ferry_manifest.json in the store
+      - manifest                   # <unit>/_ferry_manifest.json in the first destination
+      - name: catalog              # any command: the event JSON arrives on stdin
+        exec: [python, -m, my_catalog.ferry_hook]
+        cwd: C:/ferry-hooks
+        env: {CATALOG_URL: "${CATALOG_URL}"}
+        timeout: 2m
+        required: true             # finalize waits for it (the default)
 
   # Continuous: each file goes up as soon as it settles; the run registers once
-  # its marker file appears.
+  # its marker file appears; the source copy is deleted a day after every
+  # destination verified it.
   - name: operetta
     root: D:/Harmony/Export
-    store: ceph
     prefix: operetta/raw
+    destinations: [ceph, nas]
     unit: {dirs: "*"}
     mode: stream
     upload: file                   # each file as soon as it settles
@@ -60,35 +76,34 @@ sources:
     full_scan_interval: 30m
     watch: events                  # use "poll" for SMB/NFS roots
     probe_exclusive: true          # Windows: wait while another process holds a file open
-    finalize: {action: keep}
+    finalize:
+      action: delete
+      after: 1d                    # a grace period after the last verified copy
     registrars:
       - manifest
-      # - use: my_catalog.ferry:CatalogRegistrar   # your own (module:attr or an entry point)
-      #   options: {url: "${CATALOG_URL}"}
-      #   required: true           # finalize waits for it (the default)
 
   # Flat folders: group files into runs by name.
   - name: plate_reader
     root: C:/Users/Lab/Documents/PlateReader
-    store: aws
     prefix: plate-reader
+    destinations: [aws]
     unit: {regex: "^(?P<unit>[^_/]+)_"}   # RUN001_quant.csv + RUN001_melt.csv
     include: ["*.csv", "*.xlsx"]
     mode: stream
     upload: unit
     unit_idle: 5m
-    finalize: {action: keep}
 
 logs:
-  level: INFO
+  level: info
   keep_days: 30
   ship:                            # copy finished days' logs (and a heartbeat) to a store
     store: ceph
     prefix: _ferry/logs
     heartbeat: 5m
+    registrars:                    # told about each shipped day (event: log)
+      - exec: [python, -m, my_catalog.ferry_hook]
+        cwd: C:/ferry-hooks
 
 notifiers:
-  - use: webhook                   # Slack-compatible incoming webhook
-    options:
-      url: ${FERRY_ALERT_WEBHOOK}
-      min_level: warning
+  - webhook: ${FERRY_ALERT_WEBHOOK}   # Slack-compatible incoming webhook
+    min_level: warning               # info also sends each pass's digest
