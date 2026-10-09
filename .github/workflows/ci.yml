@@ -1,0 +1,98 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.1.0
+        with:
+          enable-cache: true
+      - run: uv sync --all-extras
+      - name: ruff format
+        run: uv run ruff format --check .
+      - name: ruff check
+        run: uv run ruff check .
+      - name: ty check
+        run: uv run ty check
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        # Windows is where most instrument PCs are: its file events, locking
+        # and paths are what the agent has to get right.
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ["3.11", "3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.1.0
+        with:
+          enable-cache: true
+      - run: uv sync --all-extras --python ${{ matrix.python-version }}
+      - name: pytest
+        run: uv run pytest
+
+  lowest:
+    # The declared floors hold: every runtime dependency at its minimum. The
+    # package goes in first so the test tools cannot lift those versions.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.1.0
+        with:
+          enable-cache: true
+      - name: Install at the lowest direct versions
+        run: |
+          uv venv --python 3.11
+          uv pip install --resolution lowest-direct -e ".[aws]"
+          uv pip install pytest pytest-asyncio "moto[server]"
+      - name: pytest
+        run: .venv/bin/python -m pytest
+
+  s3-seaweedfs:
+    # The S3 tests again, against a second S3 implementation that -- like Ceph
+    # RGW -- is reached path-style at a custom endpoint.
+    runs-on: ubuntu-latest
+    env:
+      FERRY_TEST_S3_ENDPOINT: http://127.0.0.1:8333
+      FERRY_TEST_S3_KEY: ferry
+      FERRY_TEST_S3_SECRET: ferry-secret
+    steps:
+      - uses: actions/checkout@v7
+      - name: Start SeaweedFS
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/seaweedfs
+          printf '{"identities":[{"name":"ferry","credentials":[{"accessKey":"%s","secretKey":"%s"}],"actions":["Admin","Read","Write","List","Tagging"]}]}' \
+            "$FERRY_TEST_S3_KEY" "$FERRY_TEST_S3_SECRET" > /tmp/seaweedfs/s3.json
+          docker run -d --name seaweedfs -p 8333:8333 \
+            -v /tmp/seaweedfs:/etc/seaweedfs:ro chrislusf/seaweedfs:4.47 \
+            server -ip.bind=0.0.0.0 -dir=/data -master.volumeSizeLimitMB=256 \
+            -volume.max=0 -filer -s3 -s3.port=8333 -s3.config=/etc/seaweedfs/s3.json
+          for _ in $(seq 60); do
+            curl -fsS http://127.0.0.1:8333/status >/dev/null && exit 0
+            sleep 1
+          done
+          docker logs seaweedfs
+          exit 1
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.1.0
+        with:
+          enable-cache: true
+      - run: uv sync --all-extras
+      - name: pytest (S3)
+        run: uv run pytest tests/test_s3.py
