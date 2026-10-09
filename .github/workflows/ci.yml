@@ -9,22 +9,25 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   lint:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Windows has its own code paths (the service, the open-file probe).
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
-      - name: Install uv
-        uses: astral-sh/setup-uv@v10.1.0
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          enable-cache: true
-      - run: uv sync --all-extras
-      - name: ruff format
-        run: uv run ruff format --check .
-      - name: ruff check
-        run: uv run ruff check .
-      - name: ty check
-        run: uv run ty check
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
 
   test:
     strategy:
@@ -33,44 +36,31 @@ jobs:
         # Windows is where most instrument PCs are: its file events, locking
         # and paths are what the agent has to get right.
         os: [ubuntu-latest, windows-latest, macos-latest]
-        python-version: ["3.11", "3.13"]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
-      - name: Install uv
-        uses: astral-sh/setup-uv@v10.1.0
-        with:
-          enable-cache: true
-      - run: uv sync --all-extras --python ${{ matrix.python-version }}
-      - name: pytest
-        run: uv run pytest
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked --no-fail-fast
 
-  lowest:
-    # The declared floors hold: every runtime dependency at its minimum. The
-    # package goes in first so the test tools cannot lift those versions.
+  msrv:
+    # The declared rust-version builds.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Install uv
-        uses: astral-sh/setup-uv@v10.1.0
-        with:
-          enable-cache: true
-      - name: Install at the lowest direct versions
-        run: |
-          uv venv --python 3.11
-          uv pip install --resolution lowest-direct -e ".[aws]"
-          uv pip install pytest pytest-asyncio "moto[server]"
-      - name: pytest
-        run: .venv/bin/python -m pytest
+      - uses: dtolnay/rust-toolchain@1.89
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --locked
 
   s3-seaweedfs:
-    # The S3 tests again, against a second S3 implementation that -- like Ceph
-    # RGW -- is reached path-style at a custom endpoint.
+    # The S3 tests, against an S3 implementation that -- like Ceph RGW -- is
+    # reached path-style at a custom endpoint.
     runs-on: ubuntu-latest
     env:
       FERRY_TEST_S3_ENDPOINT: http://127.0.0.1:8333
       FERRY_TEST_S3_KEY: ferry
       FERRY_TEST_S3_SECRET: ferry-secret
+      FERRY_TEST_S3_BUCKET: ferry-test
     steps:
       - uses: actions/checkout@v7
       - name: Start SeaweedFS
@@ -84,15 +74,31 @@ jobs:
             server -ip.bind=0.0.0.0 -dir=/data -master.volumeSizeLimitMB=256 \
             -volume.max=0 -filer -s3 -s3.port=8333 -s3.config=/etc/seaweedfs/s3.json
           for _ in $(seq 60); do
-            curl -fsS http://127.0.0.1:8333/status >/dev/null && exit 0
+            if curl -fsS http://127.0.0.1:8333/status >/dev/null; then
+              AWS_ACCESS_KEY_ID="$FERRY_TEST_S3_KEY" AWS_SECRET_ACCESS_KEY="$FERRY_TEST_S3_SECRET" \
+                AWS_DEFAULT_REGION=us-east-1 \
+                aws --endpoint-url "$FERRY_TEST_S3_ENDPOINT" s3 mb "s3://$FERRY_TEST_S3_BUCKET"
+              exit 0
+            fi
             sleep 1
           done
           docker logs seaweedfs
           exit 1
-      - name: Install uv
-        uses: astral-sh/setup-uv@v10.1.0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked --test s3
+
+  wheel:
+    # The PyPI packaging builds and its binary runs.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: PyO3/maturin-action@v1
         with:
-          enable-cache: true
-      - run: uv sync --all-extras
-      - name: pytest (S3)
-        run: uv run pytest tests/test_s3.py
+          command: build
+          args: --release --locked --out dist
+          manylinux: auto
+      - run: |
+          python3 -m venv /tmp/venv
+          /tmp/venv/bin/pip install dist/*.whl
+          /tmp/venv/bin/ferry --version
