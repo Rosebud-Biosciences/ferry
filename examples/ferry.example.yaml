@@ -1,0 +1,94 @@
+# ferry configuration: one file per node. Relative paths are resolved against
+# this file's directory; ${VAR} and ${VAR:-default} are read from the
+# environment (quote them inside {...} flow mappings).
+
+node: workcell1-pc                # default: the hostname
+state_dir: C:/ProgramData/ferry   # journal, logs and lock live here
+
+stores:
+  ceph:
+    url: s3://instrument-raw/      # bucket (and optional prefix)
+    endpoint: https://rgw.lab.internal
+    region: default                # SigV4 needs one; RGW accepts its zonegroup name
+    # virtual_hosted_style: false  # path-style, which RGW expects, is the default
+    config:                        # passed to obstore's S3Config verbatim
+      access_key_id: ${FERRY_S3_KEY}
+      secret_access_key: ${FERRY_S3_SECRET}
+    # checksum: sha256             # only where the server validates it (AWS; RGW from Tentacle)
+  aws:
+    url: s3://my-bucket/
+    region: us-west-2
+    profile: lab                   # an AWS shared-config profile (pip install 'ferry-ingest[aws]')
+
+sources:
+  # Nightly: every Cytation5 acquisition folder that is complete by 02:00 goes
+  # up whole, is registered, and moves to the backup drive.
+  - name: workcell1_cytation
+    root: C:/Users/Lab/Documents/Data/Cytation5
+    store: ceph
+    prefix: workcell/raw
+    unit: {dirs: "*__*"}           # each matching top-level folder is a unit
+    include: ["*.tif"]
+    mode: cron
+    cron: "0 2 * * *"
+    # timezone: America/Los_Angeles   # default: the node's local time
+    upload: unit                   # wait for the whole unit, then upload it
+    settle: 2m                     # a file is settled once its mtime is this old
+    unit_idle: 30m                 # complete once nothing has changed for this long
+    finalize:
+      action: move_to_backup       # keep | move_to_backup | delete_after_upload
+      backup_root: F:/Cytation5Raw
+      concurrency: 4               # keep low for spinning disks
+    limits:
+      files_in_flight: 24
+      bandwidth: {"08:00-18:00": 50MB}   # bytes/s during working hours; unlimited otherwise
+    registrars:
+      - manifest                   # <unit>/_ferry_manifest.json in the store
+
+  # Continuous: each file goes up as soon as it settles; the run registers once
+  # its marker file appears.
+  - name: operetta
+    root: D:/Harmony/Export
+    store: ceph
+    prefix: operetta/raw
+    unit: {dirs: "*"}
+    mode: stream
+    upload: file                   # each file as soon as it settles
+    marker: "images/index.xml"     # complete as soon as this exists (and all files settled)
+    settle: 30s
+    poll_interval: 15s
+    full_scan_interval: 30m
+    watch: events                  # use "poll" for SMB/NFS roots
+    probe_exclusive: true          # Windows: wait while another process holds a file open
+    finalize: {action: keep}
+    registrars:
+      - manifest
+      # - use: my_catalog.ferry:CatalogRegistrar   # your own (module:attr or an entry point)
+      #   options: {url: "${CATALOG_URL}"}
+      #   required: true           # finalize waits for it (the default)
+
+  # Flat folders: group files into runs by name.
+  - name: plate_reader
+    root: C:/Users/Lab/Documents/PlateReader
+    store: aws
+    prefix: plate-reader
+    unit: {regex: "^(?P<unit>[^_/]+)_"}   # RUN001_quant.csv + RUN001_melt.csv
+    include: ["*.csv", "*.xlsx"]
+    mode: stream
+    upload: unit
+    unit_idle: 5m
+    finalize: {action: keep}
+
+logs:
+  level: INFO
+  keep_days: 30
+  ship:                            # copy finished days' logs (and a heartbeat) to a store
+    store: ceph
+    prefix: _ferry/logs
+    heartbeat: 5m
+
+notifiers:
+  - use: webhook                   # Slack-compatible incoming webhook
+    options:
+      url: ${FERRY_ALERT_WEBHOOK}
+      min_level: warning
