@@ -1075,11 +1075,43 @@ impl Journal {
         Ok(())
     }
 
-    pub fn finalize_file(&self, file_id: i64, present: bool, backup_path: Option<&str>) -> Result<()> {
-        self.conn.execute(
-            "UPDATE file SET state = 'finalized', present = ?, backup_path = COALESCE(?, backup_path) WHERE id = ?",
-            params![present, backup_path, file_id],
+    /// Record a file's source kept, moved or deleted -- only while the row
+    /// still describes the bytes that were (`size`, `mtime_ns`, uploaded).
+    /// `false` if a scan changed it meanwhile: it then tracks new bytes.
+    pub fn finalize_file(
+        &self,
+        file_id: i64,
+        size: i64,
+        mtime_ns: i64,
+        present: bool,
+        backup_path: Option<&str>,
+    ) -> Result<bool> {
+        Ok(self.conn.execute(
+            "UPDATE file SET state = 'finalized', present = ?, backup_path = COALESCE(?, backup_path) \
+             WHERE id = ? AND state = 'uploaded' AND size = ? AND mtime_ns = ?",
+            params![present, backup_path, file_id, size, mtime_ns],
+        )? == 1)
+    }
+
+    /// A copy is gone from its destination (or no longer what was verified):
+    /// forget it, so the file goes up again, and reopen the unit, so it is
+    /// registered with the new copy.
+    pub fn copy_lost(&mut self, file_id: i64, dest: &str, why: &str, dests: &[String]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        forget_copies(&tx, &[file_id], dest, dests)?;
+        tx.execute(
+            "UPDATE copy SET last_error = ? WHERE file_id = ? AND dest = ?",
+            params![why, file_id, dest],
         )?;
+        let (unit_id, state): (i64, String) = tx.query_row(
+            "SELECT u.id, u.state FROM unit u JOIN file f ON f.unit_id = u.id WHERE f.id = ?",
+            [file_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if state != OPEN {
+            reopen(&tx, unit_id, why)?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -2075,6 +2107,22 @@ mod tests {
         Journal::open(&path).unwrap().set_meta("schema_version", "99").unwrap();
         let err = Journal::open(&path).err().unwrap().to_string();
         assert!(err.contains("upgrade ferry"), "{err}");
+    }
+
+    #[test]
+    fn a_file_is_finalized_only_while_its_row_describes_those_bytes() {
+        let mut j = Journal::in_memory().unwrap();
+        j.apply_scan("p", &scan(vec![unit("u", &[("a", 1, 1)])], None), 1.0, &dests())
+            .unwrap();
+        copy_all(&mut j, "u", &["a", "b"]);
+        let f = j.files(j.find_unit("p", "u").unwrap().unwrap().id).unwrap()[0].clone();
+
+        assert!(
+            !j.finalize_file(f.id, 1, 2, false, None).unwrap(),
+            "a scan saw new bytes"
+        );
+        assert!(j.finalize_file(f.id, 1, 1, false, None).unwrap());
+        assert!(!j.finalize_file(f.id, 1, 1, false, None).unwrap(), "once");
     }
 
     #[test]

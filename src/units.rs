@@ -80,6 +80,18 @@ enum Kind {
     Link,
 }
 
+/// Appended to a file's name while it is being finalized: it is set aside by
+/// a rename first, so a writer that comes back makes a new file instead of
+/// changing the bytes being deleted or moved. Scans never see these.
+pub const HELD_SUFFIX: &str = ".ferry-finalizing";
+
+/// Where `path` waits while it is finalized.
+pub fn held_path(path: &Path) -> PathBuf {
+    let mut held = path.as_os_str().to_owned();
+    held.push(HELD_SUFFIX);
+    PathBuf::from(held)
+}
+
 fn link_error(path: &Path) -> String {
     format!(
         "{}: symbolic links are not followed; exclude it, or replace it with what it points to",
@@ -161,6 +173,9 @@ impl Layout {
                 errors.push(format!("{}: the name is not valid Unicode", path.display()));
                 continue;
             };
+            if name.ends_with(HELD_SUFFIX) {
+                continue;
+            }
             let file_type = match entry.file_type() {
                 Ok(file_type) => file_type,
                 Err(e) => {

@@ -20,13 +20,13 @@
 //! grace period is left, so a long grace does not delay the news.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use anyhow::{Context, Result, anyhow, bail};
 use futures::StreamExt;
 use futures::future::join_all;
-use object_store::ObjectStore;
+use object_store::{ObjectStore, ObjectStoreExt};
 use rusqlite::types::Value;
 use serde::Serialize;
 use tokio::sync::Semaphore;
@@ -44,7 +44,7 @@ use crate::manifest::{
 };
 use crate::stores::Location;
 use crate::transfer::{self, Fanout as FanoutResult, ReadError, Target, UploadSettings};
-use crate::units::Layout;
+use crate::units::{Layout, held_path};
 use crate::util::{Clock, human_bytes, human_duration, iso};
 use crate::winfs::held_open;
 
@@ -191,6 +191,20 @@ enum FinalizeError {
 enum Recipient<'a> {
     Registrar(&'a BoundRegistrar),
     Notifier(&'a dyn Notifier),
+}
+
+/// A file's metadata, or `None` if it is not there.
+async fn stat(path: &Path) -> Result<Option<std::fs::Metadata>> {
+    match tokio::fs::metadata(path).await {
+        Ok(meta) => Ok(Some(meta)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// The file still has the size and mtime the journal recorded.
+fn same_stats(meta: &std::fs::Metadata, file: &FileRow) -> bool {
+    (meta.len() as i64, crate::util::mtime_ns(meta)) == (file.size, file.mtime_ns)
 }
 
 /// The outbox's name for a notifier, kept apart from registrar names.
@@ -1313,6 +1327,29 @@ impl Engine {
             .into_iter()
             .filter(|f| f.state == UPLOADED)
             .collect();
+        if action != Action::Keep && !self.dry_run {
+            match self.revalidate(&unit, &rows).await {
+                Ok(lost) if !lost.is_empty() => {
+                    for (file_id, dest, why) in &lost {
+                        self.db().copy_lost(*file_id, dest, why, &self.all_keys)?;
+                    }
+                    let why = lost[0].2.clone();
+                    tracing::warn!(
+                        pipeline = self.name.as_str(),
+                        unit = unit.key.as_str(),
+                        "not finalizing {}: {why}; sending it again",
+                        unit.key
+                    );
+                    self.report(|r| r.reopened.push((unit.key.clone(), why)));
+                    return Ok(false);
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    self.finalize_failed(&unit, &format!("cannot check its copies: {e:#}"))?;
+                    return Ok(false);
+                }
+            }
+        }
         let results = join_all(rows.iter().map(|f| self.finalize_file(&unit, f, action))).await;
         let mut changed = Vec::new();
         let mut failure = None;
@@ -1397,23 +1434,24 @@ impl Engine {
             .acquire()
             .await
             .map_err(|e| FinalizeError::Failed(e.into()))?;
+        let fail = |e: anyhow::Error| FinalizeError::Failed(e);
         let src = self.src(file);
-        let meta = match tokio::fs::metadata(&src).await {
-            Ok(meta) => Some(meta),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => return Err(FinalizeError::Failed(e.into())),
-        };
-        if let Some(meta) = &meta
-            && (meta.len() as i64, crate::util::mtime_ns(meta)) != (file.size, file.mtime_ns)
+        let held = held_path(&src);
+        let src_meta = stat(&src).await.map_err(fail)?;
+        let held_meta = stat(&held).await.map_err(fail)?;
+        // A held copy is what an interrupted finalize set aside; without one,
+        // the source must still be the bytes that were uploaded.
+        if held_meta.is_none()
+            && let Some(meta) = &src_meta
+            && !same_stats(meta, file)
         {
             return Err(FinalizeError::Changed(
                 file.id,
                 format!("{} changed after it was uploaded", file.within),
             ));
         }
-        let fail = |e: anyhow::Error| FinalizeError::Failed(e);
         if action == Action::Keep {
-            return self.db().finalize_file(file.id, meta.is_some(), None).map_err(fail);
+            return self.finalized(file, src_meta.is_some(), None).map_err(fail);
         }
         if self.dry_run {
             let verb = if action == Action::Move { "move" } else { "delete" };
@@ -1423,75 +1461,84 @@ impl Engine {
                 "[dry run] would {verb} {}",
                 src.display()
             );
-            return self.db().finalize_file(file.id, meta.is_some(), None).map_err(fail);
+            return self.finalized(file, src_meta.is_some(), None).map_err(fail);
+        }
+        let dst = match action {
+            Action::Move => Some(
+                self.cfg
+                    .finalize
+                    .backup_root
+                    .as_deref()
+                    .ok_or_else(|| fail(anyhow!("move needs a backup_root")))?
+                    .join(&file.rel),
+            ),
+            _ => None,
+        };
+        if held_meta.is_none() && src_meta.is_none() {
+            return self.finalize_missing(file, &src, dst.as_deref()).await;
+        }
+        if held_meta.is_none() {
+            // Set it aside by a rename first: a writer that comes back now
+            // makes a new file rather than changing the bytes that go.
+            tokio::fs::rename(&src, &held)
+                .await
+                .map_err(|e| fail(anyhow!("cannot set {} aside to finalize it: {e}", src.display())))?;
+        }
+        // Only the uploaded bytes may go.
+        match self.held_mismatch(&held, file, action).await {
+            Ok(None) => {}
+            Ok(Some(why)) => {
+                self.restore(&src, &held).await.map_err(fail)?;
+                return Err(FinalizeError::Changed(file.id, format!("{} {why}", file.within)));
+            }
+            Err(e) => {
+                self.restore(&src, &held).await.map_err(fail)?;
+                return Err(fail(e));
+            }
         }
         let src_text = src.to_string_lossy().into_owned();
-        let now = self.now();
-        if action == Action::Delete {
-            if meta.is_some() {
-                tokio::fs::remove_file(&src).await.map_err(|e| fail(e.into()))?;
-                self.record(NewTransfer {
-                    pipeline: &self.name,
-                    unit_id: Some(unit.id),
-                    rel: &file.rel,
-                    op: "delete",
-                    status: "ok",
-                    src: &src_text,
-                    at: now,
-                    ..Default::default()
-                })
-                .map_err(fail)?;
-            }
-            return self.db().finalize_file(file.id, false, None).map_err(fail);
-        }
-        let backup_root = self
-            .cfg
-            .finalize
-            .backup_root
-            .clone()
-            .ok_or_else(|| fail(anyhow!("move needs a backup_root")))?;
-        let dst = backup_root.join(&file.rel);
-        let dst_text = dst.to_string_lossy().into_owned();
-        if meta.is_none() {
-            // Moved already -- a crash between the move and recording it -- or
-            // removed by someone else; every destination has it either way.
-            let kept = std::fs::metadata(&dst).ok().map(|m| m.len() as i64);
-            let backup = (kept == Some(file.size)).then_some(dst_text.as_str());
-            return self.db().finalize_file(file.id, false, backup).map_err(fail);
-        }
+        let dst_text = dst.as_ref().map(|d| d.to_string_lossy().into_owned());
+        let op = if dst.is_some() { "move" } else { "delete" };
         let started = std::time::Instant::now();
-        let (from, to) = (src.clone(), dst.clone());
-        let moved = tokio::task::spawn_blocking(move || transfer::move_file(&from, &to))
-            .await
-            .map_err(|e| fail(e.into()))?;
-        match moved {
+        let outcome = match &dst {
+            None => tokio::fs::remove_file(&held).await.map(|()| file.size as u64),
+            Some(dst) => {
+                let (from, to) = (held.clone(), dst.clone());
+                let sha256 = file.current_sha256().map(str::to_string);
+                tokio::task::spawn_blocking(move || transfer::move_file(&from, &to, sha256.as_deref()))
+                    .await
+                    .map_err(|e| fail(e.into()))?
+            }
+        };
+        match outcome {
             Ok(bytes) => {
                 self.record(NewTransfer {
                     pipeline: &self.name,
                     unit_id: Some(unit.id),
                     rel: &file.rel,
-                    op: "move",
+                    op,
                     status: "ok",
                     src: &src_text,
-                    dst: &dst_text,
+                    dst: dst_text.as_deref().unwrap_or_default(),
                     bytes: Some(bytes as i64),
                     duration_ms: Some(started.elapsed().as_millis() as i64),
                     at: self.now(),
                     ..Default::default()
                 })
                 .map_err(fail)?;
-                self.db().finalize_file(file.id, false, Some(&dst_text)).map_err(fail)
+                self.finalized(file, false, dst_text.as_deref()).map_err(fail)
             }
             Err(e) => {
+                self.restore(&src, &held).await.map_err(fail)?;
                 let error = e.to_string();
                 self.record(NewTransfer {
                     pipeline: &self.name,
                     unit_id: Some(unit.id),
                     rel: &file.rel,
-                    op: "move",
+                    op,
                     status: "failed",
                     src: &src_text,
-                    dst: &dst_text,
+                    dst: dst_text.as_deref().unwrap_or_default(),
                     error: Some(&error),
                     at: self.now(),
                     ..Default::default()
@@ -1500,6 +1547,157 @@ impl Engine {
                 Err(fail(e.into()))
             }
         }
+    }
+
+    /// Why the file set aside at `held` is not the bytes that were uploaded,
+    /// if it is not: the same size and mtime, and before a delete the same
+    /// SHA-256 (a rewrite can keep both).
+    async fn held_mismatch(&self, held: &Path, file: &FileRow, action: Action) -> Result<Option<String>> {
+        let meta = tokio::fs::metadata(held).await?;
+        if !same_stats(&meta, file) {
+            return Ok(Some("changed after it was uploaded".into()));
+        }
+        if action != Action::Delete {
+            return Ok(None);
+        }
+        let Some(want) = file.current_sha256().map(str::to_string) else {
+            bail!("{} has no recorded SHA-256 to check before deleting it", file.within);
+        };
+        let path = held.to_path_buf();
+        let hashed = tokio::task::spawn_blocking(move || transfer::hash_file(&path)).await??;
+        if !hashed.steady_at((file.size as u64, file.mtime_ns)) {
+            return Ok(Some("changed while it was checked".into()));
+        }
+        if hashed.sha256 != want {
+            return Ok(Some(
+                "holds other bytes than were uploaded, at the same size and time".into(),
+            ));
+        }
+        Ok(None)
+    }
+
+    /// Put a file set aside back under its name -- or, if a new file took the
+    /// name meanwhile, beside it -- so nothing stays hidden as held.
+    async fn restore(&self, src: &Path, held: &Path) -> Result<()> {
+        let (src, held) = (src.to_path_buf(), held.to_path_buf());
+        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            for n in 0u32.. {
+                let back = if n == 0 {
+                    src.clone()
+                } else {
+                    let mut name = src.as_os_str().to_owned();
+                    name.push(format!(".ferry-restored-{n}"));
+                    PathBuf::from(name)
+                };
+                // A hard link never replaces an existing file; not every file
+                // system has them, so fall back to a checked rename.
+                match std::fs::hard_link(&held, &back) {
+                    Ok(()) => return std::fs::remove_file(&held),
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(_) if !back.exists() => return std::fs::rename(&held, &back),
+                    Err(_) => continue,
+                }
+            }
+            unreachable!("ran out of names")
+        })
+        .await??;
+        Ok(())
+    }
+
+    /// Neither the source nor a held copy is there: deleted or moved already
+    /// (a crash before it was recorded), or removed by someone else.
+    async fn finalize_missing(&self, file: &FileRow, src: &Path, dst: Option<&Path>) -> Result<(), FinalizeError> {
+        let fail = |e: anyhow::Error| FinalizeError::Failed(e);
+        let Some(dst) = dst else {
+            // Every destination holds it: the copies were checked just now.
+            return self.finalized(file, false, None).map_err(fail);
+        };
+        // Only a backup that holds the uploaded bytes counts as the move.
+        let matches = match tokio::fs::metadata(dst).await {
+            Ok(meta) if meta.len() as i64 == file.size => match file.current_sha256() {
+                Some(want) => {
+                    let path = dst.to_path_buf();
+                    let hashed = tokio::task::spawn_blocking(move || transfer::hash_file(&path))
+                        .await
+                        .map_err(|e| fail(e.into()))?
+                        .map_err(|e| fail(e.into()))?;
+                    hashed.sha256 == want
+                }
+                None => true,
+            },
+            _ => false,
+        };
+        if !matches {
+            return Err(fail(anyhow!(
+                "{} is gone, and {} does not hold what was uploaded; put one of them back, or abandon the unit",
+                src.display(),
+                dst.display()
+            )));
+        }
+        self.finalized(file, false, Some(&dst.to_string_lossy())).map_err(fail)
+    }
+
+    /// Record a file finalized, if its row still describes those bytes.
+    fn finalized(&self, file: &FileRow, present: bool, backup: Option<&str>) -> Result<()> {
+        if !self
+            .db()
+            .finalize_file(file.id, file.size, file.mtime_ns, present, backup)?
+        {
+            tracing::warn!(
+                pipeline = self.name.as_str(),
+                "{} changed while it was finalized; the new bytes go up next",
+                file.rel
+            );
+        }
+        Ok(())
+    }
+
+    /// HEAD every copy of `files`: each must still be there with the size
+    /// sent and, where one was recorded, the same ETag -- an object deleted or
+    /// overwritten since it was verified does not count. Returns those that
+    /// fail, as (file, destination, why).
+    async fn revalidate(&self, unit: &UnitRow, files: &[FileRow]) -> Result<Vec<(i64, String, String)>> {
+        let copies = self.db().unit_copies(unit.id)?;
+        let mut checks = Vec::new();
+        for file in files {
+            for dest in &self.destinations {
+                let etag = copies
+                    .get(&file.id)
+                    .and_then(|cs| cs.iter().find(|c| c.dest == dest.key))
+                    .and_then(|c| c.etag.clone());
+                let rel = Layout::remote_rel(&unit.key, &file.within);
+                checks.push((
+                    file.id,
+                    file.size as u64,
+                    rel,
+                    dest.key.clone(),
+                    dest.location.clone(),
+                    etag,
+                ));
+            }
+        }
+        let results: Vec<Result<Option<(i64, String, String)>>> = futures::stream::iter(checks)
+            .map(|(file_id, size, rel, dest, location, etag)| async move {
+                let uri = location.uri_for(&rel);
+                let why = match location.store.inner.head(&location.key(&rel)?).await {
+                    Ok(meta) if meta.size != size => Some(format!("{uri} holds {} bytes, not {size}", meta.size)),
+                    Ok(meta) if etag.is_some() && meta.e_tag != etag => {
+                        Some(format!("{uri} was overwritten since it was verified"))
+                    }
+                    Ok(_) => None,
+                    Err(object_store::Error::NotFound { .. }) => Some(format!("{uri} is gone")),
+                    Err(e) => return Err(anyhow::Error::from(e)),
+                };
+                Ok(why.map(|why| (file_id, dest, why)))
+            })
+            .buffer_unordered(16)
+            .collect()
+            .await;
+        let mut lost = Vec::new();
+        for result in results {
+            lost.extend(result?);
+        }
+        Ok(lost)
     }
 
     fn finalize_failed(&self, unit: &UnitRow, error: &str) -> Result<()> {

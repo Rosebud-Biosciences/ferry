@@ -914,6 +914,118 @@ async fn big_files_go_up_in_parts_to_every_destination() {
     assert_eq!(registered[0].files[0].sha256.as_deref(), Some(sha256(&body).as_str()));
 }
 
+#[tokio::test]
+async fn a_copy_that_vanished_is_sent_again_before_the_source_goes() {
+    let h = Harness::new();
+    let cfg = h.config("    finalize: {action: delete, after: 1h}\n");
+    write(&h.src.join("u__1/a.tif"), b"data");
+    age_tree(&h.src, hour_ago());
+    h.pass(&cfg).await;
+    std::fs::remove_file(h.remote.join("u__1/a.tif")).unwrap();
+
+    h.clock.advance(3601.0);
+    let report = h.pass(&cfg).await;
+    assert!(h.src.join("u__1/a.tif").exists(), "kept while a copy is missing");
+    assert!(report.reopened[0].1.contains("is gone"), "{:?}", report.reopened);
+
+    h.pass(&cfg).await;
+    assert_eq!(data_files(&h.remote), tree(&[("u__1/a.tif", b"data")]));
+    h.clock.advance(3601.0);
+    h.pass(&cfg).await;
+    assert!(!h.src.join("u__1").exists());
+}
+
+#[tokio::test]
+async fn an_overwritten_copy_does_not_vouch_for_a_delete() {
+    let h = Harness::new();
+    let cfg = h.config("    finalize: {action: delete, after: 1h}\n");
+    write(&h.src.join("u__1/a.tif"), b"data");
+    age_tree(&h.src, hour_ago());
+    h.pass(&cfg).await;
+    // Same size, other bytes: only its ETag tells.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    std::fs::write(h.remote.join("u__1/a.tif"), b"DATA").unwrap();
+
+    h.clock.advance(3601.0);
+    let report = h.pass(&cfg).await;
+    assert!(h.src.join("u__1/a.tif").exists());
+    assert!(
+        report.reopened[0].1.contains("was overwritten"),
+        "{:?}",
+        report.reopened
+    );
+}
+
+#[tokio::test]
+async fn a_rewrite_that_keeps_size_and_time_is_caught_before_a_delete() {
+    let h = Harness::new();
+    let cfg = h.config("    finalize: {action: delete, after: 1h}\n");
+    let path = write(&h.src.join("u__1/a.tif"), b"data");
+    age_tree(&h.src, hour_ago());
+    h.pass(&cfg).await;
+    let mtime = filetime::FileTime::from_last_modification_time(&std::fs::metadata(&path).unwrap());
+    std::fs::write(&path, b"DATA").unwrap();
+    filetime::set_file_mtime(&path, mtime).unwrap();
+
+    h.clock.advance(3601.0);
+    let report = h.pass(&cfg).await;
+    assert_eq!(std::fs::read(&path).unwrap(), b"DATA", "put back, not deleted");
+    assert!(
+        report.reopened[0].1.contains("holds other bytes"),
+        "{:?}",
+        report.reopened
+    );
+    assert!(!h.src.join("u__1/a.tif.ferry-finalizing").exists());
+}
+
+#[tokio::test]
+async fn a_finalize_interrupted_after_setting_a_file_aside_resumes() {
+    let h = Harness::new();
+    let cfg = h.config(&format!(
+        "    finalize: {{action: move, backup_root: '{}', after: 1h}}\n",
+        h.backup.display()
+    ));
+    let path = write(&h.src.join("u__1/a.tif"), b"data");
+    age_tree(&h.src, hour_ago());
+    h.pass(&cfg).await;
+    // As if ferry stopped right after the rename.
+    std::fs::rename(&path, h.src.join("u__1/a.tif.ferry-finalizing")).unwrap();
+
+    h.clock.advance(3601.0);
+    let report = h.pass(&cfg).await;
+    assert_eq!(report.finalized, ["u__1"]);
+    assert_eq!(files_under(&h.backup), tree(&[("u__1/a.tif", b"data")]));
+    assert!(!h.src.join("u__1").exists());
+}
+
+#[tokio::test]
+async fn a_move_whose_source_vanished_needs_a_backup_that_matches() {
+    let h = Harness::new();
+    let cfg = h.config(&format!(
+        "    finalize: {{action: move, backup_root: '{}', after: 1h}}\n",
+        h.backup.display()
+    ));
+    let path = write(&h.src.join("u__1/a.tif"), b"data");
+    age_tree(&h.src, hour_ago());
+    h.pass(&cfg).await;
+    std::fs::remove_file(&path).unwrap();
+
+    h.clock.advance(3601.0);
+    let report = h.pass(&cfg).await;
+    assert_eq!(report.finalize_failures, 1);
+    assert_eq!(h.unit_state(&cfg, "u__1").as_deref(), Some("registered"));
+
+    write(&h.backup.join("u__1/a.tif"), b"DATA");
+    h.clock.advance(3601.0);
+    let report = h.pass(&cfg).await;
+    assert_eq!(report.finalize_failures, 1, "a backup with other bytes does not count");
+
+    std::fs::write(h.backup.join("u__1/a.tif"), b"data").unwrap();
+    h.clock.advance(3601.0);
+    let report = h.pass(&cfg).await;
+    assert_eq!(report.finalized, ["u__1"]);
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn a_unit_with_a_folder_it_cannot_read_waits_for_it() {
