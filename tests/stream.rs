@@ -33,13 +33,17 @@ struct Watching {
 
 impl Watching {
     fn start(h: &Harness, cfg: &Config) -> Self {
+        Self::start_with(cfg, h.options(false))
+    }
+
+    fn start_with(cfg: &Config, base: AgentOptions) -> Self {
         let options = AgentOptions {
             clock: Arc::new(SystemClock),
             stream: StreamOptions {
                 digest_every: Duration::from_secs(3600),
                 grace: Duration::from_secs(5),
             },
-            ..h.options(false)
+            ..base
         };
         let agent = Arc::new(Agent::open(cfg.clone(), options).unwrap());
         let stop = CancellationToken::new();
@@ -60,6 +64,32 @@ impl Watching {
 
 fn registered(h: &Harness) -> usize {
     h.recorder.manifests(Register).len()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stream_posts_the_receipt_once_the_unit_is_moved() {
+    let h = Harness::new();
+    let cfg = h.config(&format!(
+        "    settle: 300ms\n    unit_idle: 600ms\n    poll_interval: 100ms\n    full_scan_interval: 60s\n    watch: poll\n{}",
+        h.backup_extra("move")
+    ));
+    write_at(&h.src.join("u__1/a.tif"), b"data", wall());
+    let inbox = Inbox::receipts();
+
+    let watching = Watching::start_with(&cfg, h.notifying(&inbox));
+    eventually("the receipt posted", Duration::from_secs(15), || {
+        !inbox.receipts_seen().is_empty()
+    })
+    .await;
+    watching.stop().await;
+
+    let receipts = inbox.receipts_seen();
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(
+        (receipts[0].original.action.as_str(), receipts[0].original.done),
+        ("move", true)
+    );
+    assert!(h.backup.join("u__1/a.tif").exists());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

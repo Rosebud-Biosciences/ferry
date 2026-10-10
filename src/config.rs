@@ -515,14 +515,16 @@ impl HookConfig {
         self.exec
             .as_ref()
             .and_then(|argv| argv.first())
-            .map(|program| {
-                Path::new(program)
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| program.clone())
-            })
+            .map(|program| program_name(program))
             .unwrap_or_else(|| "hook".into())
     }
+}
+
+fn program_name(program: &str) -> String {
+    Path::new(program)
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| program.to_string())
 }
 
 impl FromStr for HookConfig {
@@ -564,20 +566,64 @@ impl Default for ManifestHook {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NotifierEvent {
+    /// Recurring failures, units stuck open, and (at `info`) each pass's digest.
+    Alert,
+    /// One per unit, once every destination holds it (see `docs/hooks.md`).
+    Receipt,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WebhookFormat {
+    /// `{"text": ...}`, which Slack incoming webhooks accept (as do Mattermost,
+    /// Rocket.Chat, Google Chat, and Discord's `/slack` webhook URLs).
+    #[default]
+    Text,
+    /// The event JSON itself, as an exec hook gets it.
+    Event,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NotifierConfig {
-    /// POST alerts as Slack-compatible `{"text": ...}` JSON to this URL.
+    /// Names the notifier in the journal, where its receipts wait until it
+    /// takes them. Defaults to `webhook`, or the `exec` program's name.
+    pub name: Option<String>,
+    /// POST each event to this URL, as `format` says.
     pub webhook: Option<String>,
-    /// Or run this command per alert, with the alert event JSON on stdin.
+    /// Or run this command per event, with the event JSON on stdin.
     pub exec: Option<Vec<String>>,
+    #[serde(default = "alerts_only")]
+    pub events: Vec<NotifierEvent>,
+    /// The least severe alert it takes.
     #[serde(default)]
     pub min_level: Level,
+    /// How a `webhook` posts: `text` (the default) or `event`.
+    pub format: Option<WebhookFormat>,
     pub cwd: Option<PathBuf>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     #[serde(default = "one_m", deserialize_with = "de_duration")]
     pub timeout: Duration,
+}
+
+fn alerts_only() -> Vec<NotifierEvent> {
+    vec![NotifierEvent::Alert]
+}
+
+impl NotifierConfig {
+    pub fn key(&self) -> String {
+        if let Some(name) = &self.name {
+            return name.clone();
+        }
+        match self.exec.as_ref().and_then(|argv| argv.first()) {
+            Some(program) => program_name(program),
+            None => "webhook".into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -937,12 +983,25 @@ impl Config {
                 }
             }
         }
+        let mut receivers = BTreeSet::new();
         for (i, notifier) in self.notifiers.iter().enumerate() {
             if notifier.webhook.is_some() == notifier.exec.is_some() {
                 bail!("notifiers[{i}]: set exactly one of `webhook` or `exec`");
             }
             if notifier.exec.as_ref().is_some_and(Vec::is_empty) {
                 bail!("notifiers[{i}]: exec needs a command");
+            }
+            if notifier.events.is_empty() {
+                bail!("notifiers[{i}]: events is empty; list `alert`, `receipt` or both");
+            }
+            if notifier.format.is_some() && notifier.webhook.is_none() {
+                bail!("notifiers[{i}]: `format` applies to webhooks; an exec hook always gets the event JSON");
+            }
+            if notifier.events.contains(&NotifierEvent::Receipt) && !receivers.insert(notifier.key()) {
+                bail!(
+                    "notifiers that take receipts need distinct names ({} repeats); add `name:`",
+                    notifier.key()
+                );
             }
         }
         if let Some(ship) = &self.logs.ship {
@@ -1225,5 +1284,42 @@ mod tests {
         assert_eq!(retry.backoff(1), 30.0);
         assert_eq!(retry.backoff(2), 60.0);
         assert_eq!(retry.backoff(10), 3600.0);
+    }
+
+    #[test]
+    fn notifiers_take_alerts_unless_told_otherwise() {
+        let cfg = load(
+            "notifiers:\n  - webhook: https://chat.example/a\n  - name: arrivals\n    webhook: https://chat.example/b\n    events: [receipt]\n    format: event\n  - exec: [/opt/bin/page-oncall.sh]\n    events: [alert, receipt]\n",
+        )
+        .unwrap();
+        let summary: Vec<(String, Vec<NotifierEvent>, Option<WebhookFormat>)> = cfg
+            .notifiers
+            .iter()
+            .map(|n| (n.key(), n.events.clone(), n.format))
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                ("webhook".into(), vec![NotifierEvent::Alert], None),
+                (
+                    "arrivals".into(),
+                    vec![NotifierEvent::Receipt],
+                    Some(WebhookFormat::Event)
+                ),
+                (
+                    "page-oncall".into(),
+                    vec![NotifierEvent::Alert, NotifierEvent::Receipt],
+                    None
+                ),
+            ]
+        );
+
+        let err = |extra: &str| load(extra).unwrap_err().to_string();
+        assert!(err("notifiers:\n  - webhook: a\n    events: []\n").contains("events is empty"));
+        assert!(err("notifiers:\n  - exec: [notify]\n    format: text\n").contains("`format` applies to webhooks"));
+        let twice = "notifiers:\n  - {webhook: a, events: [receipt]}\n  - {webhook: b, events: [receipt]}\n";
+        assert!(err(twice).contains("(webhook repeats)"), "{}", err(twice));
+        // Names only matter where receipts wait: two alert webhooks are fine.
+        load("notifiers:\n  - webhook: a\n  - webhook: b\n").unwrap();
     }
 }

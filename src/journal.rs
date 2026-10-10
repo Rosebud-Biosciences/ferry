@@ -14,6 +14,9 @@
 //! then `finalized` once the source copy is kept, moved or deleted. Because a
 //! copy only counts while its stats match, a file that changes is pending again
 //! for every destination without any bookkeeping beyond the new stats.
+//!
+//! `receipt_gen` is the last generation of a unit whose receipt was queued for
+//! the notifiers, so each generation is announced once.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -40,7 +43,7 @@ pub const PENDING: &str = "pending";
 pub const UPLOADED: &str = "uploaded";
 pub const DONE: &str = "done";
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS unit (
@@ -62,9 +65,12 @@ CREATE TABLE IF NOT EXISTS unit (
     last_error TEXT,
     alerted INTEGER NOT NULL DEFAULT 0,
     note TEXT,
+    receipt_gen INTEGER,
     UNIQUE (pipeline, key)
 );
 CREATE INDEX IF NOT EXISTS unit_by_state ON unit (pipeline, state);
+CREATE INDEX IF NOT EXISTS unit_unannounced ON unit (pipeline)
+    WHERE state IN ('registered', 'finalized') AND (receipt_gen IS NULL OR receipt_gen < generation);
 CREATE TABLE IF NOT EXISTS file (
     id INTEGER PRIMARY KEY,
     unit_id INTEGER NOT NULL REFERENCES unit (id) ON DELETE CASCADE,
@@ -167,6 +173,7 @@ pub struct UnitRow {
     pub last_error: Option<String>,
     pub alerted: bool,
     pub note: Option<String>,
+    pub receipt_gen: Option<i64>,
 }
 
 impl UnitRow {
@@ -190,6 +197,7 @@ impl UnitRow {
             last_error: r.get("last_error")?,
             alerted: r.get("alerted")?,
             note: r.get("note")?,
+            receipt_gen: r.get("receipt_gen")?,
         })
     }
 }
@@ -424,6 +432,20 @@ const UNIT_COLUMNS: &[&str] = &[
     "note",
 ];
 
+/// Version 2 records which generation of each unit had its receipt queued.
+/// Units registered or finalized before the upgrade count as announced, so an
+/// upgrade never sends receipts for them.
+fn migrate_to_2(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "BEGIN;
+         ALTER TABLE unit ADD COLUMN receipt_gen INTEGER;
+         UPDATE unit SET receipt_gen = generation WHERE state IN ('registered', 'finalized');
+         UPDATE meta SET value = '2' WHERE key = 'schema_version';
+         COMMIT;",
+    )?;
+    Ok(())
+}
+
 pub struct Journal {
     conn: Connection,
 }
@@ -461,22 +483,26 @@ impl Journal {
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.busy_timeout(std::time::Duration::from_secs(30))?;
-        conn.execute_batch(SCHEMA)?;
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);")?;
         let found: Option<String> = conn
             .query_row("SELECT value FROM meta WHERE key = 'schema_version'", [], |r| r.get(0))
             .optional()?;
-        match found {
-            None => {
-                conn.execute(
-                    "INSERT INTO meta (key, value) VALUES ('schema_version', ?)",
-                    [SCHEMA_VERSION.to_string()],
-                )?;
+        if let Some(v) = &found {
+            match v.parse::<i64>().unwrap_or(i64::MAX) {
+                newer if newer > SCHEMA_VERSION => {
+                    bail!("the journal has schema {v}; this ferry understands {SCHEMA_VERSION} -- upgrade ferry");
+                }
+                // Before SCHEMA, whose indexes need the new column.
+                1 => migrate_to_2(&conn)?,
+                _ => {}
             }
-            Some(v) if v.parse::<i64>().unwrap_or(i64::MAX) > SCHEMA_VERSION => {
-                bail!("the journal has schema {v}; this ferry understands {SCHEMA_VERSION} -- upgrade ferry");
-            }
-            Some(_) => {}
         }
+        conn.execute_batch(SCHEMA)?;
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('schema_version', ?) \
+             ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+            [SCHEMA_VERSION.to_string()],
+        )?;
         Ok(Self { conn })
     }
 
@@ -1037,6 +1063,48 @@ impl Journal {
             |r| r.get(0),
         )?;
         Ok(waiting == 0)
+    }
+
+    /// Registered and finalized units whose current generation has had no
+    /// receipt queued.
+    pub fn unannounced(&self, pipeline: &str) -> Result<Vec<UnitRow>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT * FROM unit WHERE pipeline = ? AND state IN ('registered', 'finalized') \
+             AND (receipt_gen IS NULL OR receipt_gen < generation) ORDER BY first_seen, id",
+        )?;
+        let rows = stmt.query_map([pipeline], UnitRow::from_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Mark `generation` of a unit announced and queue its receipt for each of
+    /// `notifiers`, in one transaction. `false` (and nothing queued) if that
+    /// generation was announced already, or the unit moved on.
+    pub fn announce(
+        &mut self,
+        unit_id: i64,
+        generation: i64,
+        notifiers: &[String],
+        payload: &str,
+        now: f64,
+    ) -> Result<bool> {
+        let tx = self.conn.transaction()?;
+        let marked = tx.execute(
+            "UPDATE unit SET receipt_gen = ?2 WHERE id = ?1 AND generation = ?2 \
+             AND state IN ('registered', 'finalized') AND (receipt_gen IS NULL OR receipt_gen < ?2)",
+            params![unit_id, generation],
+        )?;
+        if marked != 1 {
+            return Ok(false);
+        }
+        for notifier in notifiers {
+            tx.execute(
+                "INSERT INTO outbox (unit_id, generation, registrar, event, required, payload, created_at) \
+                 VALUES (?, ?, ?, 'receipt', 0, ?, ?)",
+                params![unit_id, generation, notifier, payload, now],
+            )?;
+        }
+        tx.commit()?;
+        Ok(true)
     }
 
     // -- operator actions ---------------------------------------------------
@@ -1688,5 +1756,67 @@ mod tests {
         Journal::open(&path).unwrap().set_meta("schema_version", "99").unwrap();
         let err = Journal::open(&path).err().unwrap().to_string();
         assert!(err.contains("upgrade ferry"), "{err}");
+    }
+
+    #[test]
+    fn each_generation_of_a_unit_is_announced_once() {
+        let mut j = Journal::in_memory().unwrap();
+        j.apply_scan("p", &scan(vec![unit("u", &[("a", 1, 1)])], None), 1.0, &dests())
+            .unwrap();
+        let u = j.find_unit("p", "u").unwrap().unwrap();
+        assert!(j.unannounced("p").unwrap().is_empty(), "open units are not delivered");
+        let registered = [
+            ("state", Value::from(REGISTERED.to_string())),
+            ("generation", Value::from(1)),
+        ];
+        j.set_unit(u.id, None, None, &registered).unwrap();
+
+        let chat = ["notifier:chat".to_string()];
+        assert!(j.announce(u.id, 1, &chat, "{}", 2.0).unwrap());
+        assert!(!j.announce(u.id, 1, &chat, "{}", 3.0).unwrap());
+        assert!(j.unannounced("p").unwrap().is_empty());
+        let queued: Vec<(String, String, bool)> = j
+            .outbox_for_unit(u.id)
+            .unwrap()
+            .into_iter()
+            .map(|o| (o.event, o.registrar, o.required))
+            .collect();
+        assert_eq!(queued, [("receipt".into(), "notifier:chat".into(), false)]);
+
+        j.set_unit(u.id, None, None, &[("generation", Value::from(2))]).unwrap();
+        assert_eq!(j.unannounced("p").unwrap()[0].receipt_gen, Some(1));
+        assert!(!j.announce(u.id, 1, &chat, "{}", 4.0).unwrap(), "a stale generation");
+        assert!(
+            j.announce(u.id, 2, &[], "", 5.0).unwrap(),
+            "announced with nobody listening"
+        );
+        assert_eq!(j.outbox_for_unit(u.id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn upgrading_a_version_1_journal_announces_nothing_already_delivered() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.sqlite3");
+        Journal::open(&path)
+            .unwrap()
+            .conn
+            .execute_batch(
+                "INSERT INTO unit (pipeline, key, state, generation, first_seen, last_change) VALUES \
+                 ('p', 'done', 'finalized', 3, 1, 1), ('p', 'waiting', 'registered', 1, 1, 1), \
+                 ('p', 'busy', 'open', 1, 1, 1);
+                 DROP INDEX unit_unannounced;
+                 ALTER TABLE unit DROP COLUMN receipt_gen;
+                 UPDATE meta SET value = '1' WHERE key = 'schema_version';",
+            )
+            .unwrap();
+
+        let j = Journal::open(&path).unwrap();
+        assert_eq!(j.get_meta("schema_version").unwrap().as_deref(), Some("2"));
+        let gen_of = |key: &str| j.find_unit("p", key).unwrap().unwrap().receipt_gen;
+        assert_eq!(
+            (gen_of("done"), gen_of("waiting"), gen_of("busy")),
+            (Some(3), Some(1), None)
+        );
+        assert!(j.unannounced("p").unwrap().is_empty());
     }
 }

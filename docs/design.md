@@ -196,6 +196,14 @@ Within one round ferry stops calling a registrar after its first failure, so a
 catalog that is down costs one timeout rather than one per waiting unit. An
 alert goes out after `retry.alert_after` attempts.
 
+People get one receipt per unit rather than a stream of log lines: once every
+destination holds it and its source files are dealt with, or only the
+`finalize.after` grace is left. Receipts go through the same outbox, keyed by
+notifier name, so a chat service that is down delays them without losing any;
+the journal records which generation of each unit was announced, so a restart
+or an upgrade never repeats one. Downstream processing should start from
+registration instead, which comes first and is meant for machines.
+
 ## Scheduling and streaming
 
 Cron expressions are evaluated by `croner` in an IANA zone, or as local

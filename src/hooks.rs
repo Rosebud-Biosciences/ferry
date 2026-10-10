@@ -1,8 +1,9 @@
-//! Hooks: where completed units, failures, logs and alerts go.
+//! Hooks: where completed units, failures, logs, alerts and receipts go.
 //!
 //! Registrars receive `register` / `finalize` / `failures` / `log` events
 //! through a durable outbox, so one that is down delays registration but never
-//! the uploads. Delivery is at-least-once: a hook must treat a repeated event
+//! the uploads. Notifiers take alerts, best effort, and receipts, through the
+//! same outbox. Delivery is at-least-once: a hook must treat a repeated event
 //! for the same unit and generation as a no-op. An `exec` hook is any command:
 //! ferry writes the event JSON to its stdin, and a zero exit code means it was
 //! handled. Anything else (or the timeout) is a failure, retried with backoff,
@@ -19,7 +20,7 @@ use async_trait::async_trait;
 use object_store::{ObjectStoreExt, PutPayload};
 use tokio::io::AsyncWriteExt;
 
-use crate::config::{HookConfig, Level, NotifierConfig};
+use crate::config::{HookConfig, Level, NotifierConfig, NotifierEvent, WebhookFormat};
 use crate::manifest::{Alert, Event, EventKind, ManifestDoc};
 use crate::stores::Location;
 use crate::util::tail;
@@ -198,23 +199,56 @@ pub fn registrar_from(hook: &HookConfig, manifest_location: Option<Location>) ->
 
 #[async_trait]
 pub trait Notifier: Send + Sync {
+    /// Keys the receipts waiting for this notifier in the journal.
+    fn name(&self) -> &str;
     fn min_level(&self) -> Level;
+    /// Whether it takes `kind` events: alerts only, unless configured otherwise.
+    fn wants(&self, kind: EventKind) -> bool {
+        kind == EventKind::Alert
+    }
     async fn notify(&self, event: &Event) -> Result<()>;
 }
 
-/// POSTs `{"text": ...}`, the body Slack incoming webhooks (and Mattermost,
-/// Teams workflows, ...) accept.
+fn takes(events: &[NotifierEvent], kind: EventKind) -> bool {
+    events.iter().any(|e| match e {
+        NotifierEvent::Alert => kind == EventKind::Alert,
+        NotifierEvent::Receipt => kind == EventKind::Receipt,
+    })
+}
+
+/// The body a webhook POSTs for `event`.
+pub fn webhook_body(format: WebhookFormat, event: &Event) -> Result<serde_json::Value> {
+    if format == WebhookFormat::Event {
+        return Ok(serde_json::to_value(event)?);
+    }
+    let text = if let Some(alert) = &event.alert {
+        alert.text()
+    } else if let Some(receipt) = &event.receipt {
+        receipt.text(&event.node, event.pipeline.as_deref().unwrap_or_default())
+    } else {
+        bail!("a {} event has no text form", event.event.as_str());
+    };
+    Ok(serde_json::json!({ "text": text }))
+}
+
+/// POSTs each event to a URL, as [`webhook_body`] renders it.
 pub struct WebhookNotifier {
+    pub name: String,
     pub url: String,
+    pub events: Vec<NotifierEvent>,
     pub min_level: Level,
+    pub format: WebhookFormat,
     client: reqwest::Client,
 }
 
 impl WebhookNotifier {
-    pub fn new(url: String, min_level: Level) -> Self {
+    pub fn new(name: String, url: String, events: Vec<NotifierEvent>, min_level: Level, format: WebhookFormat) -> Self {
         Self {
+            name,
             url,
+            events,
             min_level,
+            format,
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(10))
                 .build()
@@ -225,15 +259,22 @@ impl WebhookNotifier {
 
 #[async_trait]
 impl Notifier for WebhookNotifier {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
     fn min_level(&self) -> Level {
         self.min_level
     }
 
+    fn wants(&self, kind: EventKind) -> bool {
+        takes(&self.events, kind)
+    }
+
     async fn notify(&self, event: &Event) -> Result<()> {
-        let alert = event.alert.as_ref().context("alert event without an alert")?;
         self.client
             .post(&self.url)
-            .json(&serde_json::json!({ "text": alert.text() }))
+            .json(&webhook_body(self.format, event)?)
             .send()
             .await?
             .error_for_status()?;
@@ -243,13 +284,22 @@ impl Notifier for WebhookNotifier {
 
 pub struct ExecNotifier {
     pub hook: ExecHook,
+    pub events: Vec<NotifierEvent>,
     pub min_level: Level,
 }
 
 #[async_trait]
 impl Notifier for ExecNotifier {
+    fn name(&self) -> &str {
+        &self.hook.name
+    }
+
     fn min_level(&self) -> Level {
         self.min_level
+    }
+
+    fn wants(&self, kind: EventKind) -> bool {
+        takes(&self.events, kind)
     }
 
     async fn notify(&self, event: &Event) -> Result<()> {
@@ -257,11 +307,18 @@ impl Notifier for ExecNotifier {
     }
 }
 
-pub fn notifier_from(cfg: &NotifierConfig, index: usize) -> Arc<dyn Notifier> {
+pub fn notifier_from(cfg: &NotifierConfig) -> Arc<dyn Notifier> {
     match (&cfg.webhook, &cfg.exec) {
-        (Some(url), _) => Arc::new(WebhookNotifier::new(url.clone(), cfg.min_level)),
+        (Some(url), _) => Arc::new(WebhookNotifier::new(
+            cfg.key(),
+            url.clone(),
+            cfg.events.clone(),
+            cfg.min_level,
+            cfg.format.unwrap_or_default(),
+        )),
         (None, Some(argv)) => Arc::new(ExecNotifier {
-            hook: exec_hook(format!("notifier {index}"), argv, &cfg.cwd, &cfg.env, cfg.timeout),
+            hook: exec_hook(cfg.key(), argv, &cfg.cwd, &cfg.env, cfg.timeout),
+            events: cfg.events.clone(),
             min_level: cfg.min_level,
         }),
         (None, None) => unreachable!("validated: a notifier has webhook or exec"),
@@ -308,7 +365,7 @@ impl Alerts {
         event.alert = Some(alert.clone());
         let event = Arc::new(event);
         for notifier in &self.notifiers {
-            if alert.level < notifier.min_level() {
+            if !notifier.wants(EventKind::Alert) || alert.level < notifier.min_level() {
                 continue;
             }
             let (notifier, event) = (notifier.clone(), event.clone());
@@ -336,6 +393,86 @@ impl Alerts {
             .map(|mut p| p.drain(..).collect())
             .unwrap_or_default();
         let _ = tokio::time::timeout(Duration::from_secs(15), futures::future::join_all(handles)).await;
+    }
+}
+
+#[cfg(test)]
+mod notifier_tests {
+    use super::*;
+    use crate::manifest::{Original, Receipt, ReceiptCopy};
+
+    fn config(yaml: &str) -> NotifierConfig {
+        yaml_serde::from_str(yaml).unwrap()
+    }
+
+    #[test]
+    fn notifiers_take_what_their_config_lists() {
+        let alerts = notifier_from(&config("webhook: https://chat.example/a"));
+        assert_eq!(alerts.name(), "webhook");
+        assert!(alerts.wants(EventKind::Alert) && !alerts.wants(EventKind::Receipt));
+        let receipts = notifier_from(&config("{name: arrivals, exec: [post], events: [receipt]}"));
+        assert_eq!(receipts.name(), "arrivals");
+        assert!(receipts.wants(EventKind::Receipt) && !receipts.wants(EventKind::Alert));
+    }
+
+    #[test]
+    fn webhooks_post_text_or_the_event_itself() {
+        let mut alert = Event::new(EventKind::Alert, "pc1", Some("inst"));
+        alert.alert = Some(Alert {
+            level: Level::Error,
+            title: "inst: u__1 is stuck".into(),
+            message: "since noon".into(),
+            pipeline: Some("inst".into()),
+            unit: Some("u__1".into()),
+        });
+        assert_eq!(
+            webhook_body(WebhookFormat::Text, &alert).unwrap(),
+            serde_json::json!({"text": "inst: u__1 is stuck\nsince noon"})
+        );
+        let raw = webhook_body(WebhookFormat::Event, &alert).unwrap();
+        assert_eq!(
+            (
+                raw["schema"].as_str(),
+                raw["event"].as_str(),
+                raw["alert"]["unit"].as_str()
+            ),
+            (Some("ferry.event/v1"), Some("alert"), Some("u__1"))
+        );
+
+        let mut receipt = Event::new(EventKind::Receipt, "pc1", Some("inst"));
+        receipt.receipt = Some(Receipt {
+            unit: "u__1".into(),
+            generation: 1,
+            update: false,
+            files: 2,
+            bytes: 2048,
+            first_seen: "2026-10-09T08:00:00.000Z".into(),
+            delivered: "2026-10-09T08:30:00.000Z".into(),
+            duration_s: 1800,
+            destinations: vec![ReceiptCopy {
+                name: "s3".into(),
+                uri: "s3://raw/u__1".into(),
+                verified: "size".into(),
+            }],
+            registrars: Vec::new(),
+            original: Original {
+                action: "keep".into(),
+                done: true,
+                at: None,
+                path: None,
+            },
+        });
+        let text = webhook_body(WebhookFormat::Text, &receipt).unwrap();
+        assert!(
+            text["text"]
+                .as_str()
+                .unwrap()
+                .ends_with("original kept\npc1 · inst · delivered 30m after its first file"),
+            "{text}"
+        );
+
+        let register = Event::new(EventKind::Register, "pc1", Some("inst"));
+        assert!(webhook_body(WebhookFormat::Text, &register).is_err());
     }
 }
 

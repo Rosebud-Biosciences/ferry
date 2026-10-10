@@ -14,6 +14,10 @@
 //! - Source files are kept, moved or deleted only once *every* destination holds
 //!   a verified copy, every required registrar has confirmed the unit, any
 //!   `finalize.after` grace has passed, and the files still match what was sent.
+//!
+//! Each generation of a unit then gets one receipt for the notifiers that take
+//! receipts: once its source files were dealt with, or as soon as only the
+//! grace period is left, so a long grace does not delay the news.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
@@ -29,12 +33,15 @@ use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{Action, Fanout, Level, PipelineConfig, Upload, Verify};
-use crate::hooks::{Alerts, Registrar};
+use crate::hooks::{Alerts, Notifier, Registrar};
 use crate::journal::{
     COMPLETE, Candidate, FINALIZED, FileRow, Journal, NewTransfer, OPEN, OutboxRow, REGISTERED, REGISTERING,
     ScanChanges, TransferRow, UPLOADED, UnitRow,
 };
-use crate::manifest::{Alert, Event, EventKind, FileCopy, Manifest, ManifestDestination, ManifestFile, TransferEvent};
+use crate::manifest::{
+    Alert, Event, EventKind, FileCopy, Manifest, ManifestDestination, ManifestFile, Original, Receipt, ReceiptCopy,
+    TransferEvent,
+};
 use crate::stores::Location;
 use crate::transfer::{self, Fanout as FanoutResult, ReadError, Target, UploadSettings};
 use crate::units::Layout;
@@ -180,11 +187,34 @@ enum FinalizeError {
     Failed(anyhow::Error),
 }
 
+/// Who an outbox row is for.
+enum Recipient<'a> {
+    Registrar(&'a BoundRegistrar),
+    Notifier(&'a dyn Notifier),
+}
+
+/// The outbox's name for a notifier, kept apart from registrar names.
+fn receipt_key(notifier: &dyn Notifier) -> String {
+    format!("notifier:{}", notifier.name())
+}
+
+/// What delivering `row` does, for logs and alerts.
+fn describe(row: &OutboxRow, unit: &str) -> String {
+    match row.registrar.strip_prefix("notifier:") {
+        Some(notifier) if row.event == EventKind::Receipt.as_str() => {
+            format!("post the receipt for {unit} to {notifier}")
+        }
+        _ => format!("{} {unit} with {}", row.event, row.registrar),
+    }
+}
+
 pub struct EngineParts {
     pub node: String,
     pub cfg: PipelineConfig,
     pub destinations: Vec<Destination>,
     pub registrars: Vec<BoundRegistrar>,
+    /// The notifiers that take receipts.
+    pub notifiers: Vec<Arc<dyn Notifier>>,
     pub journal: Arc<Mutex<Journal>>,
     pub alerts: Arc<Alerts>,
     pub dry_run: bool,
@@ -201,6 +231,7 @@ pub struct Engine {
     pub layout: Arc<Layout>,
     pub dry_run: bool,
     pub clock: Arc<dyn Clock>,
+    notifiers: Vec<Arc<dyn Notifier>>,
     journal: Arc<Mutex<Journal>>,
     settings: UploadSettings,
     report: Mutex<PassReport>,
@@ -236,6 +267,7 @@ impl Engine {
             cfg: parts.cfg,
             destinations: parts.destinations,
             registrars: parts.registrars,
+            notifiers: parts.notifiers,
             alerts: parts.alerts,
             layout,
             dry_run: parts.dry_run,
@@ -874,8 +906,18 @@ impl Engine {
         Ok(queued)
     }
 
-    /// Hand due outbox rows to their registrars; promote confirmed units.
+    /// Hand due outbox rows to their registrars and notifiers, promote confirmed
+    /// units, and queue (and send) receipts for units now delivered.
     pub async fn deliver(&self) -> Result<usize> {
+        let mut delivered = self.deliver_due().await?;
+        self.promote_confirmed()?;
+        if self.queue_receipts()? > 0 {
+            delivered += self.deliver_due().await?;
+        }
+        Ok(delivered)
+    }
+
+    async fn deliver_due(&self) -> Result<usize> {
         let mut delivered = 0;
         let mut failing: BTreeSet<String> = BTreeSet::new();
         let rows = self.db().due_outbox(&self.name, self.now())?;
@@ -885,7 +927,18 @@ impl Engine {
             if failing.contains(&row.registrar) {
                 continue;
             }
-            let Some(bound) = self.registrars.iter().find(|r| r.key == row.registrar) else {
+            let recipient = if row.event == EventKind::Receipt.as_str() {
+                self.notifiers
+                    .iter()
+                    .find(|n| receipt_key(n.as_ref()) == row.registrar)
+                    .map(|n| Recipient::Notifier(n.as_ref()))
+            } else {
+                self.registrars
+                    .iter()
+                    .find(|r| r.key == row.registrar)
+                    .map(Recipient::Registrar)
+            };
+            let Some(recipient) = recipient else {
                 tracing::warn!(
                     pipeline = self.name.as_str(),
                     "dropping a {} for {:?}, which is no longer configured",
@@ -896,30 +949,37 @@ impl Engine {
                 continue;
             };
             let event: Event = serde_json::from_str(&row.payload).context("outbox payload")?;
-            let unit_key = event.manifest.as_ref().map(|m| m.unit.clone()).unwrap_or_default();
+            let unit_key = event.unit().unwrap_or_default().to_string();
+            let what = describe(&row, &unit_key);
             if self.dry_run {
                 tracing::info!(
                     pipeline = self.name.as_str(),
                     unit = unit_key.as_str(),
-                    "[dry run] would {} {unit_key} with {}",
-                    row.event,
-                    row.registrar
+                    "[dry run] would {what}"
                 );
                 self.db().outbox_done(row.id, self.now())?;
                 delivered += 1;
                 continue;
             }
-            match bound.registrar.deliver(&event).await {
+            let result = match recipient {
+                Recipient::Registrar(bound) => bound.registrar.deliver(&event).await,
+                Recipient::Notifier(notifier) => notifier.notify(&event).await,
+            };
+            match result {
                 Ok(()) => {
                     self.db().outbox_done(row.id, self.now())?;
                     delivered += 1;
                 }
                 Err(e) => {
                     failing.insert(row.registrar.clone());
-                    self.delivery_failed(&row, &unit_key, &format!("{e:#}"))?;
+                    self.delivery_failed(&row, &unit_key, &what, &format!("{e:#}"))?;
                 }
             }
         }
+        Ok(delivered)
+    }
+
+    fn promote_confirmed(&self) -> Result<()> {
         let units = self.db().units(&self.name, Some(&[REGISTERING]))?;
         for unit in units {
             if !self.db().required_done(unit.id, unit.generation, "register")? {
@@ -941,10 +1001,10 @@ impl Engine {
                 );
             }
         }
-        Ok(delivered)
+        Ok(())
     }
 
-    fn delivery_failed(&self, row: &OutboxRow, unit: &str, error: &str) -> Result<()> {
+    fn delivery_failed(&self, row: &OutboxRow, unit: &str, what: &str, error: &str) -> Result<()> {
         let attempts = row.attempts as u32 + 1;
         self.db()
             .outbox_failed(row.id, error, self.now() + self.cfg.retry.backoff(attempts))?;
@@ -952,24 +1012,114 @@ impl Engine {
         tracing::error!(
             pipeline = self.name.as_str(),
             unit,
-            "could not {} {unit} with {} (attempt {attempts}): {error}",
-            row.event,
-            row.registrar
+            "could not {what} (attempt {attempts}): {error}"
         );
         if attempts >= self.cfg.retry.alert_after && !row.alerted {
             self.db().outbox_alerted(row.id)?;
             self.alerts.emit(Alert {
                 level: Level::Error,
-                title: format!(
-                    "{}: cannot {} {unit} with {} ({attempts} attempts)",
-                    self.name, row.event, row.registrar
-                ),
+                title: format!("{}: cannot {what} ({attempts} attempts)", self.name),
                 message: error.to_string(),
                 pipeline: Some(self.name.clone()),
                 unit: Some(unit.to_string()),
             });
         }
         Ok(())
+    }
+
+    // -- receipts -----------------------------------------------------------
+    /// Queue a receipt for each unit every destination now holds and every
+    /// required registrar has confirmed: once its source files were kept,
+    /// moved or deleted, or as soon as only `finalize.after` is left to wait.
+    /// A unit whose finalizing is failing waits; its alerts tell that story.
+    fn queue_receipts(&self) -> Result<usize> {
+        let now = self.now();
+        let keys: Vec<String> = self.notifiers.iter().map(|n| receipt_key(n.as_ref())).collect();
+        let mut queued = 0;
+        let units = self.db().unannounced(&self.name)?;
+        for unit in units {
+            let original = if unit.state == FINALIZED {
+                self.original(&unit, true, unit.finalized_at)
+            } else {
+                match self.finalize_due_at(&unit)? {
+                    Some(due) if due > now && unit.last_error.is_none() => self.original(&unit, false, Some(due)),
+                    _ => continue,
+                }
+            };
+            let payload = if keys.is_empty() {
+                String::new()
+            } else {
+                let mut event = Event::new(EventKind::Receipt, &self.node, Some(&self.name));
+                event.receipt = Some(self.receipt(&unit, original, now)?);
+                serde_json::to_string(&event)?
+            };
+            if self.db().announce(unit.id, unit.generation, &keys, &payload, now)? && !keys.is_empty() {
+                queued += 1;
+            }
+        }
+        Ok(queued)
+    }
+
+    fn original(&self, unit: &UnitRow, done: bool, at: Option<f64>) -> Original {
+        let action = self.cfg.finalize.action;
+        let path = match (action, &self.cfg.finalize.backup_root) {
+            (Action::Move, Some(root)) => Some(root.join(&unit.key).to_string_lossy().into_owned()),
+            _ => None,
+        };
+        Original {
+            action: action.as_str().into(),
+            done,
+            at: at.map(iso),
+            path,
+        }
+    }
+
+    fn receipt(&self, unit: &UnitRow, original: Original, now: f64) -> Result<Receipt> {
+        let files: Vec<FileRow> = self.db().files(unit.id)?.into_iter().filter(FileRow::live).collect();
+        let copies = self.db().unit_copies(unit.id)?;
+        let destinations = self
+            .destinations
+            .iter()
+            .map(|d| {
+                let hashed = files.iter().all(|f| {
+                    copies.get(&f.id).into_iter().flatten().any(|c| {
+                        c.dest == d.key && c.is_current(f) && c.verified.as_deref() == Some(Verify::Sha256.as_str())
+                    })
+                });
+                ReceiptCopy {
+                    name: d.key.clone(),
+                    uri: d.location.uri_for(&unit.key),
+                    verified: if hashed { Verify::Sha256 } else { Verify::Size }.as_str().into(),
+                }
+            })
+            .collect();
+        let confirmed: BTreeSet<String> = self
+            .db()
+            .outbox_for_unit(unit.id)?
+            .into_iter()
+            .filter(|o| {
+                o.event == EventKind::Register.as_str() && o.generation == unit.generation && o.done_at.is_some()
+            })
+            .map(|o| o.registrar)
+            .collect();
+        Ok(Receipt {
+            unit: unit.key.clone(),
+            generation: unit.generation,
+            update: unit.receipt_gen.is_some(),
+            files: files.len(),
+            bytes: files.iter().map(|f| f.size).sum(),
+            first_seen: iso(unit.first_seen),
+            delivered: iso(now),
+            duration_s: (now - unit.first_seen).max(0.0).round() as u64,
+            destinations,
+            registrars: self
+                .registrars
+                .iter()
+                .filter(|r| confirmed.contains(&r.key))
+                .map(|r| r.key.clone())
+                .collect(),
+            original,
+        })
     }
 
     /// Hand failed transfers to registrars' audit trails, once each.

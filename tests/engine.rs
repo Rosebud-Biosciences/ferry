@@ -7,7 +7,6 @@ use ferry::config::Level;
 use ferry::journal::Journal;
 use ferry::manifest::EventKind::{Failures, Finalize, Register};
 use ferry::runner::{Agent, AgentOptions};
-use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 #[tokio::test]
@@ -672,17 +671,14 @@ async fn each_pass_digest_reaches_notifiers_as_one_alert() {
     let cfg = h.config("");
     write(&h.src.join("u__1/a.tif"), b"data");
     age_tree(&h.src, hour_ago());
-    let inbox = Arc::new(common::Inbox::default());
-    let options = AgentOptions {
-        notifiers: Some(vec![inbox.clone()]),
-        ..h.options(false)
-    };
-    let agent = Agent::open(cfg.clone(), options).unwrap();
+    let inbox = Inbox::alerts();
+    let agent = Agent::open(cfg.clone(), h.notifying(&inbox)).unwrap();
     let stop = CancellationToken::new();
     agent.run_once(&[], &stop).await.unwrap();
     agent.run_once(&[], &stop).await.unwrap();
 
-    let digests: Vec<_> = inbox.0.lock().unwrap().iter().filter_map(|e| e.alert.clone()).collect();
+    assert!(inbox.receipts_seen().is_empty(), "an alert notifier takes no receipts");
+    let digests = inbox.alerts_seen();
     assert_eq!(digests.len(), 2);
     assert_eq!(digests[0].level, Level::Info);
     assert_eq!(digests[0].pipeline.as_deref(), Some("inst"));
@@ -696,6 +692,128 @@ async fn each_pass_digest_reaches_notifiers_as_one_alert() {
         "{}",
         digests[1].title
     );
+}
+
+#[tokio::test]
+async fn a_delivered_unit_gets_one_receipt_saying_where_it_went() {
+    let h = Harness::new();
+    let cfg = h.config_with(
+        "[remote, {store: mirror, verify: sha256}]",
+        "[{name: rec, exec: [unused]}]",
+        &h.backup_extra("move"),
+    );
+    write(&h.src.join("plateA__1/img/a.tif"), b"alpha");
+    write(&h.src.join("plateA__1/b.tif"), b"bravo!");
+    age_tree(&h.src, hour_ago());
+    let inbox = Inbox::receipts();
+
+    h.pass_with(
+        &cfg,
+        AgentOptions {
+            dry_run: true,
+            ..h.notifying(&inbox)
+        },
+    )
+    .await;
+    assert!(inbox.events.lock().unwrap().is_empty(), "a dry run posts nothing");
+    h.pass_with(&cfg, h.notifying(&inbox)).await;
+    h.pass_with(&cfg, h.notifying(&inbox)).await;
+
+    assert!(inbox.alerts_seen().is_empty(), "a receipt notifier takes no digests");
+    let receipts = inbox.receipts_seen();
+    assert_eq!(receipts.len(), 1, "one per unit, however many passes");
+    let r = &receipts[0];
+    assert_eq!(
+        (r.unit.as_str(), r.generation, r.update, r.files, r.bytes),
+        ("plateA__1", 1, false, 2, 11)
+    );
+    let copies: Vec<(&str, &str)> = r
+        .destinations
+        .iter()
+        .map(|d| (d.name.as_str(), d.verified.as_str()))
+        .collect();
+    assert_eq!(copies, [("remote", "size"), ("mirror", "sha256")]);
+    assert_eq!(r.registrars, ["rec"]);
+    assert_eq!(
+        (r.original.action.as_str(), r.original.done, r.original.path.clone()),
+        ("move", true, Some(h.backup.join("plateA__1").display().to_string()))
+    );
+    let event = inbox.events.lock().unwrap()[0].clone();
+    assert_eq!(
+        (event.node.as_str(), event.pipeline.as_deref()),
+        ("test-node", Some("inst"))
+    );
+}
+
+#[tokio::test]
+async fn a_receipt_does_not_wait_out_the_grace_before_a_delete() {
+    let h = Harness::new();
+    let cfg = h.config("    finalize: {action: delete, after: 1h}\n");
+    write(&h.src.join("u__1/a.tif"), b"data");
+    age_tree(&h.src, hour_ago());
+    let inbox = Inbox::receipts();
+
+    h.pass_with(&cfg, h.notifying(&inbox)).await;
+    assert!(h.src.join("u__1/a.tif").exists());
+    let receipts = inbox.receipts_seen();
+    assert_eq!(receipts.len(), 1);
+    let original = &receipts[0].original;
+    assert_eq!((original.action.as_str(), original.done), ("delete", false));
+    let secs = |t: &str| chrono::DateTime::parse_from_rfc3339(t).unwrap().timestamp();
+    assert_eq!(
+        secs(original.at.as_deref().unwrap()) - secs(&receipts[0].delivered),
+        3600
+    );
+
+    h.clock.advance(3601.0);
+    h.pass_with(&cfg, h.notifying(&inbox)).await;
+    assert!(!h.src.join("u__1").exists());
+    assert_eq!(inbox.receipts_seen().len(), 1, "the deletion itself posts nothing more");
+}
+
+#[tokio::test]
+async fn a_receipt_waits_in_the_journal_while_chat_is_down() {
+    let h = Harness::new();
+    let cfg = h.config("");
+    write(&h.src.join("u__1/a.tif"), b"data");
+    age_tree(&h.src, hour_ago());
+    let inbox = Inbox::receipts();
+    *inbox.failing.lock().unwrap() = 1;
+
+    let report = h.pass_with(&cfg, h.notifying(&inbox)).await;
+    assert_eq!(report.delivery_failures, 1);
+    assert_eq!(
+        h.unit_state(&cfg, "u__1").as_deref(),
+        Some("finalized"),
+        "receipts hold nothing up"
+    );
+    h.pass_with(&cfg, h.notifying(&inbox)).await;
+    assert!(inbox.receipts_seen().is_empty(), "backing off");
+
+    h.clock.advance(31.0);
+    h.pass_with(&cfg, h.notifying(&inbox)).await;
+    assert_eq!(inbox.receipts_seen().len(), 1);
+}
+
+#[tokio::test]
+async fn files_that_arrive_after_a_receipt_bring_an_update() {
+    let h = Harness::new();
+    let cfg = h.config("");
+    write(&h.src.join("u__1/a.tif"), b"a");
+    age_tree(&h.src, hour_ago());
+    let inbox = Inbox::receipts();
+    h.pass_with(&cfg, h.notifying(&inbox)).await;
+
+    write(&h.src.join("u__1/b.tif"), b"bb");
+    h.clock.advance(10.0);
+    h.pass_with(&cfg, h.notifying(&inbox)).await;
+
+    let seen: Vec<(i64, bool, usize, i64)> = inbox
+        .receipts_seen()
+        .iter()
+        .map(|r| (r.generation, r.update, r.files, r.bytes))
+        .collect();
+    assert_eq!(seen, [(1, false, 1, 1), (2, true, 2, 3)]);
 }
 
 #[tokio::test]

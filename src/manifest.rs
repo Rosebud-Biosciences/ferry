@@ -2,12 +2,14 @@
 //!
 //! `register` and `finalize` carry the unit's [`Manifest`]; `failures` carries
 //! failed transfers for an audit trail; `log` a shipped log file; `alert` an
-//! alert (notifiers only). Consumers should ignore events and fields they do not
-//! know, so new ones can be added without a schema bump.
+//! alert and `receipt` a delivered unit's [`Receipt`] (notifiers only).
+//! Consumers should ignore events and fields they do not know, so new ones can
+//! be added without a schema bump.
 
 use serde::{Deserialize, Serialize};
 
 use crate::config::Level;
+use crate::util::{human_bytes, human_duration};
 
 pub const EVENT_SCHEMA: &str = "ferry.event/v1";
 pub const MANIFEST_SCHEMA: &str = "ferry.manifest/v1";
@@ -20,6 +22,7 @@ pub enum EventKind {
     Failures,
     Log,
     Alert,
+    Receipt,
 }
 
 impl EventKind {
@@ -30,6 +33,7 @@ impl EventKind {
             Self::Failures => "failures",
             Self::Log => "log",
             Self::Alert => "alert",
+            Self::Receipt => "receipt",
         }
     }
 
@@ -40,6 +44,7 @@ impl EventKind {
             "failures" => Self::Failures,
             "log" => Self::Log,
             "alert" => Self::Alert,
+            "receipt" => Self::Receipt,
             _ => return None,
         })
     }
@@ -61,6 +66,8 @@ pub struct Event {
     pub log: Option<ShippedLog>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub alert: Option<Alert>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<Receipt>,
 }
 
 impl Event {
@@ -75,7 +82,16 @@ impl Event {
             transfers: Vec::new(),
             log: None,
             alert: None,
+            receipt: None,
         }
+    }
+
+    /// The unit the event is about, if any.
+    pub fn unit(&self) -> Option<&str> {
+        self.manifest
+            .as_ref()
+            .map(|m| m.unit.as_str())
+            .or_else(|| self.receipt.as_ref().map(|r| r.unit.as_str()))
     }
 }
 
@@ -168,6 +184,105 @@ impl Alert {
     }
 }
 
+/// A unit every destination holds, whose required registrars confirmed it:
+/// one per unit and generation, for people rather than pipelines.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Receipt {
+    pub unit: String,
+    pub generation: i64,
+    /// An earlier generation of the unit had a receipt already.
+    pub update: bool,
+    pub files: usize,
+    pub bytes: i64,
+    pub first_seen: String,
+    pub delivered: String,
+    /// From the unit's first file to delivery.
+    pub duration_s: u64,
+    pub destinations: Vec<ReceiptCopy>,
+    /// The registrars that confirmed the unit.
+    pub registrars: Vec<String>,
+    pub original: Original,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReceiptCopy {
+    pub name: String,
+    pub uri: String,
+    /// `sha256` if every file was read back and hashed; otherwise `size`.
+    pub verified: String,
+}
+
+/// What became of the source files, or will once `finalize.after` passes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Original {
+    /// `keep`, `move` or `delete`.
+    pub action: String,
+    pub done: bool,
+    /// When it was done, or is due.
+    pub at: Option<String>,
+    /// Where `move` puts the unit.
+    pub path: Option<String>,
+}
+
+impl Receipt {
+    /// The receipt as a chat message.
+    pub fn text(&self, node: &str, pipeline: &str) -> String {
+        let files = match self.files {
+            1 => "1 file".to_string(),
+            n => format!("{n} files"),
+        };
+        let mut lines = vec![
+            if self.update {
+                "acquisition (updated):"
+            } else {
+                "acquisition:"
+            }
+            .to_string(),
+            format!("• {} ({files}, {})", self.unit, human_bytes(self.bytes.max(0) as u64)),
+            "copied to:".to_string(),
+        ];
+        for copy in &self.destinations {
+            let how = if copy.verified == "sha256" {
+                "SHA-256 verified"
+            } else {
+                "size verified"
+            };
+            lines.push(format!("• {} ({how})", copy.uri));
+        }
+        let mut status = Vec::new();
+        if !self.registrars.is_empty() {
+            status.push(format!("registered with {}", self.registrars.join(", ")));
+        }
+        status.push(self.original.text());
+        lines.push(status.join(" · "));
+        lines.push(format!(
+            "{node} · {pipeline} · delivered {} after its first file",
+            human_duration(self.duration_s as f64)
+        ));
+        lines.join("\n")
+    }
+}
+
+impl Original {
+    fn text(&self) -> String {
+        let path = self.path.as_deref().unwrap_or("its backup root");
+        let when = self.at.as_deref().map(minutes_utc).unwrap_or_default();
+        match (self.action.as_str(), self.done) {
+            ("move", true) => format!("original moved to {path}"),
+            ("move", false) => format!("original moves to {path} at {when}"),
+            ("delete", true) => "original deleted".to_string(),
+            ("delete", false) => format!("original will be deleted at {when}"),
+            _ => "original kept".to_string(),
+        }
+    }
+}
+
+fn minutes_utc(timestamp: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(timestamp)
+        .map(|t| t.to_utc().format("%Y-%m-%d %H:%M UTC").to_string())
+        .unwrap_or_else(|_| timestamp.to_string())
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ShippedLog {
     pub node: String,
@@ -187,4 +302,82 @@ pub struct ManifestDoc<'a> {
     pub pipeline: &'a str,
     #[serde(flatten)]
     pub manifest: &'a Manifest,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn receipt(action: &str, done: bool) -> Receipt {
+        Receipt {
+            unit: "plateA__1".into(),
+            generation: 1,
+            update: false,
+            files: 384,
+            bytes: 512_300_000_000,
+            first_seen: "2026-10-09T08:02:11.000Z".into(),
+            delivered: "2026-10-09T10:16:40.000Z".into(),
+            duration_s: 8069,
+            destinations: vec![
+                ReceiptCopy {
+                    name: "ceph".into(),
+                    uri: "s3://raw/workcell/plateA__1".into(),
+                    verified: "sha256".into(),
+                },
+                ReceiptCopy {
+                    name: "nas".into(),
+                    uri: "file:///mnt/archive/plateA__1".into(),
+                    verified: "size".into(),
+                },
+            ],
+            registrars: vec!["rb_db".into()],
+            original: Original {
+                action: action.into(),
+                done,
+                at: Some("2026-10-16T10:16:40.000Z".into()),
+                path: (action == "move").then(|| "F:/Cytation5Raw/plateA__1".into()),
+            },
+        }
+    }
+
+    #[test]
+    fn a_receipt_reads_as_one_chat_message() {
+        assert_eq!(
+            receipt("delete", true).text("workcell1", "cytation"),
+            "acquisition:\n\
+             • plateA__1 (384 files, 512.3 GB)\n\
+             copied to:\n\
+             • s3://raw/workcell/plateA__1 (SHA-256 verified)\n\
+             • file:///mnt/archive/plateA__1 (size verified)\n\
+             registered with rb_db · original deleted\n\
+             workcell1 · cytation · delivered 2h after its first file"
+        );
+    }
+
+    #[test]
+    fn the_original_line_says_what_happened_or_when_it_will() {
+        let status = |r: Receipt| r.text("n", "p").lines().nth(5).unwrap().to_string();
+        assert_eq!(
+            status(receipt("move", true)),
+            "registered with rb_db · original moved to F:/Cytation5Raw/plateA__1"
+        );
+        assert_eq!(
+            status(receipt("move", false)),
+            "registered with rb_db · original moves to F:/Cytation5Raw/plateA__1 at 2026-10-16 10:16 UTC"
+        );
+        assert_eq!(
+            status(receipt("delete", false)),
+            "registered with rb_db · original will be deleted at 2026-10-16 10:16 UTC"
+        );
+        let mut kept = receipt("keep", true);
+        kept.registrars.clear();
+        kept.update = true;
+        kept.files = 1;
+        let text = kept.text("n", "p");
+        assert!(
+            text.starts_with("acquisition (updated):\n• plateA__1 (1 file, "),
+            "{text}"
+        );
+        assert_eq!(text.lines().nth(5), Some("original kept"));
+    }
 }

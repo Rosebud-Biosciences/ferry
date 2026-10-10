@@ -170,9 +170,12 @@ at-least-once and in order per unit, and nothing is finalized until every
 the data.
 
 **Notifiers** receive alerts: failures that keep recurring, units stuck open,
-and each pass's digest (as `info`, or `warning` if anything failed).
-`webhook: URL` posts Slack-compatible JSON; `exec:` runs a command with the
-alert event on stdin.
+and each pass's digest (as `info`, or `warning` if anything failed). With
+`events: [receipt]`, a notifier gets one receipt per unit once it is delivered
+instead: where each copy is, how it was verified, and whether the source files
+were kept, moved or deleted. Receipts wait in the outbox until they are taken.
+`webhook: URL` posts Slack-compatible text (or, with `format: event`, the event
+JSON); `exec:` runs a command with the event on stdin.
 
 [`docs/hooks.md`](docs/hooks.md) specifies the events, with an example hook.
 
