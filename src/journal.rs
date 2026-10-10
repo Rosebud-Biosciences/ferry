@@ -43,7 +43,7 @@ pub const PENDING: &str = "pending";
 pub const UPLOADED: &str = "uploaded";
 pub const DONE: &str = "done";
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS unit (
@@ -102,6 +102,13 @@ CREATE TABLE IF NOT EXISTS copy (
     last_error TEXT,
     alerted INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (file_id, dest)
+);
+CREATE TABLE IF NOT EXISTS destination (
+    pipeline TEXT NOT NULL,
+    name TEXT NOT NULL,
+    identity TEXT NOT NULL,
+    verify TEXT NOT NULL,
+    PRIMARY KEY (pipeline, name)
 );
 CREATE TABLE IF NOT EXISTS adoption (
     unit_id INTEGER NOT NULL REFERENCES unit (id) ON DELETE CASCADE,
@@ -397,6 +404,33 @@ pub struct ScanChanges {
     pub unreadable: Vec<(String, String)>,
 }
 
+/// Where a destination points, and how it verifies copies.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Binding {
+    pub name: String,
+    pub identity: String,
+    pub verify: String,
+}
+
+/// A destination that now points somewhere other than where its copies are.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Moved {
+    pub name: String,
+    pub was: String,
+    pub now: String,
+}
+
+/// What `ferry destination reset` changes.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ResetPlan {
+    /// Files whose copy there is forgotten, to go up again.
+    pub files: i64,
+    /// Units already registered or complete, which register again.
+    pub reopened: Vec<String>,
+    /// Copies of finalized files, kept as a record: their sources are gone.
+    pub kept: i64,
+}
+
 /// A file ready to upload, and the destinations that still need it.
 #[derive(Debug, Clone)]
 pub struct Candidate {
@@ -453,6 +487,8 @@ fn migrate(conn: &Connection, from: i64) -> Result<()> {
     if from < 3 {
         add_column(&tx, "unit", "scan_error", "TEXT")?;
     }
+    // 4 adds the `destination` table; the first run after the upgrade records
+    // where each destination points.
     tx.execute(
         "UPDATE meta SET value = ? WHERE key = 'schema_version'",
         [SCHEMA_VERSION.to_string()],
@@ -623,6 +659,131 @@ impl Journal {
 
     /// Give every file of every unfinished unit a copy row per destination, so a
     /// destination added to the config picks up what is not yet finalized.
+    /// Check each destination against what the journal recorded: the first
+    /// time, record it. A stronger `verify` than recorded sends the copies it
+    /// did not cover again; a destination that now points elsewhere is
+    /// returned, and left for an operator to accept or reset.
+    pub fn bind_destinations(&mut self, pipeline: &str, bindings: &[Binding], dests: &[String]) -> Result<Vec<Moved>> {
+        let tx = self.conn.transaction()?;
+        let mut moved = Vec::new();
+        for b in bindings {
+            let known: Option<(String, String)> = tx
+                .query_row(
+                    "SELECT identity, verify FROM destination WHERE pipeline = ? AND name = ?",
+                    params![pipeline, b.name],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            match known {
+                None => {
+                    tx.execute(
+                        "INSERT INTO destination (pipeline, name, identity, verify) VALUES (?, ?, ?, ?)",
+                        params![pipeline, b.name, b.identity, b.verify],
+                    )?;
+                }
+                Some((identity, _)) if identity != b.identity => moved.push(Moved {
+                    name: b.name.clone(),
+                    was: identity,
+                    now: b.identity.clone(),
+                }),
+                Some((_, verify)) if verify != b.verify => {
+                    if b.verify == "sha256" {
+                        let weaker = live_copies(
+                            &tx,
+                            pipeline,
+                            &b.name,
+                            "AND (c.verified IS NULL OR c.verified != 'sha256')",
+                        )?;
+                        forget_copies(&tx, &weaker, &b.name, dests)?;
+                    }
+                    tx.execute(
+                        "UPDATE destination SET verify = ? WHERE pipeline = ? AND name = ?",
+                        params![b.verify, pipeline, b.name],
+                    )?;
+                }
+                Some(_) => {}
+            }
+        }
+        tx.commit()?;
+        Ok(moved)
+    }
+
+    /// The identity the journal recorded for a destination, if any.
+    pub fn destination(&self, pipeline: &str, name: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT identity FROM destination WHERE pipeline = ? AND name = ?",
+                params![pipeline, name],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// The destination's new settings reach the same objects: record them and
+    /// keep its copies.
+    pub fn accept_destination(&mut self, pipeline: &str, binding: &Binding) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO destination (pipeline, name, identity, verify) VALUES (?, ?, ?, ?) \
+             ON CONFLICT (pipeline, name) DO UPDATE SET identity = excluded.identity, verify = excluded.verify",
+            params![pipeline, binding.name, binding.identity, binding.verify],
+        )?;
+        Ok(())
+    }
+
+    /// Forget a destination's copies of every file not yet finalized, so they
+    /// go up again; units already complete or registered reopen to register
+    /// with the new copies. With `apply` false, only report what would change.
+    pub fn reset_destination(
+        &mut self,
+        pipeline: &str,
+        binding: &Binding,
+        dests: &[String],
+        apply: bool,
+    ) -> Result<ResetPlan> {
+        let tx = self.conn.transaction()?;
+        let files = live_copies(&tx, pipeline, &binding.name, "")?;
+        let mut plan = ResetPlan {
+            files: files.len() as i64,
+            ..Default::default()
+        };
+        let units: Vec<(i64, String)> = {
+            let mut stmt = tx.prepare(
+                "SELECT DISTINCT u.id, u.key FROM unit u JOIN file f ON f.unit_id = u.id \
+                 JOIN copy c ON c.file_id = f.id WHERE u.pipeline = ? AND c.dest = ? AND c.state = 'done' \
+                 AND f.state IN ('pending', 'uploaded') AND u.state IN ('complete', 'registering', 'registered') \
+                 ORDER BY u.key",
+            )?;
+            stmt.query_map(params![pipeline, binding.name], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        plan.reopened = units.iter().map(|(_, key)| key.clone()).collect();
+        plan.kept = tx.query_row(
+            "SELECT COUNT(*) FROM copy c JOIN file f ON f.id = c.file_id JOIN unit u ON u.id = f.unit_id \
+             WHERE u.pipeline = ? AND c.dest = ? AND c.state = 'done' \
+             AND (f.state = 'finalized' OR u.state = 'finalized')",
+            params![pipeline, binding.name],
+            |r| r.get(0),
+        )?;
+        if apply {
+            forget_copies(&tx, &files, &binding.name, dests)?;
+            for (unit_id, _) in &units {
+                reopen(&tx, *unit_id, &format!("destination {} was reset", binding.name))?;
+            }
+            tx.execute(
+                "DELETE FROM adoption WHERE dest = ? AND unit_id IN (SELECT id FROM unit WHERE pipeline = ?)",
+                params![binding.name, pipeline],
+            )?;
+            tx.execute(
+                "INSERT INTO destination (pipeline, name, identity, verify) VALUES (?, ?, ?, ?) \
+                 ON CONFLICT (pipeline, name) DO UPDATE SET identity = excluded.identity, verify = excluded.verify",
+                params![pipeline, binding.name, binding.identity, binding.verify],
+            )?;
+            tx.commit()?;
+        }
+        Ok(plan)
+    }
+
     pub fn ensure_copies(&mut self, pipeline: &str, dests: &[String]) -> Result<()> {
         let tx = self.conn.transaction()?;
         for dest in dests {
@@ -1332,6 +1493,32 @@ impl Journal {
 
 // -- scan helpers (inside a transaction) -------------------------------------
 
+/// Files not yet finalized with a made copy at `dest` (`extra`: more
+/// conditions on that copy, `c`).
+fn live_copies(conn: &Connection, pipeline: &str, dest: &str, extra: &str) -> rusqlite::Result<Vec<i64>> {
+    let sql = format!(
+        "SELECT f.id FROM file f JOIN unit u ON u.id = f.unit_id JOIN copy c ON c.file_id = f.id \
+         WHERE u.pipeline = ? AND c.dest = ? AND c.state = 'done' AND f.state IN ('pending', 'uploaded') \
+         AND u.state NOT IN ('finalized', 'abandoned', 'gone') {extra}"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    stmt.query_map(params![pipeline, dest], |r| r.get(0))?.collect()
+}
+
+/// Make the copies of `files` at `dest` pending, so they go up again.
+fn forget_copies(conn: &Connection, files: &[i64], dest: &str, dests: &[String]) -> rusqlite::Result<()> {
+    for id in files {
+        conn.execute(
+            "UPDATE copy SET state = 'pending', up_size = NULL, up_mtime_ns = NULL, etag = NULL, verified = NULL, \
+             uploaded_at = NULL, attempts = 0, next_attempt = NULL, last_error = NULL, alerted = 0 \
+             WHERE file_id = ? AND dest = ?",
+            params![id, dest],
+        )?;
+        refresh_file(conn, *id, dests)?;
+    }
+    Ok(())
+}
+
 fn refresh_file(conn: &Connection, file_id: i64, dests: &[String]) -> rusqlite::Result<()> {
     if dests.is_empty() {
         return Ok(());
@@ -1850,6 +2037,90 @@ mod tests {
         Journal::open(&path).unwrap().set_meta("schema_version", "99").unwrap();
         let err = Journal::open(&path).err().unwrap().to_string();
         assert!(err.contains("upgrade ferry"), "{err}");
+    }
+
+    fn binding(identity: &str, verify: &str) -> Binding {
+        Binding {
+            name: "a".into(),
+            identity: identity.into(),
+            verify: verify.into(),
+        }
+    }
+
+    #[test]
+    fn a_destination_that_moved_waits_to_be_accepted_or_reset() {
+        let mut j = Journal::in_memory().unwrap();
+        j.apply_scan("p", &scan(vec![unit("u", &[("a", 1, 1)])], None), 1.0, &dests())
+            .unwrap();
+        copy_all(&mut j, "u", &["a", "b"]);
+        assert!(
+            j.bind_destinations("p", &[binding("s3://x/raw", "size")], &dests())
+                .unwrap()
+                .is_empty()
+        );
+
+        let moved = j
+            .bind_destinations("p", &[binding("s3://y/raw", "size")], &dests())
+            .unwrap();
+        assert_eq!(
+            moved,
+            [Moved {
+                name: "a".into(),
+                was: "s3://x/raw".into(),
+                now: "s3://y/raw".into()
+            }]
+        );
+        assert_eq!(
+            states(&j, "u"),
+            [("a".into(), "uploaded".into())],
+            "nothing changes on its own"
+        );
+
+        let preview = j
+            .reset_destination("p", &binding("s3://y/raw", "size"), &dests(), false)
+            .unwrap();
+        assert_eq!(preview.files, 1);
+        assert_eq!(j.destination("p", "a").unwrap().as_deref(), Some("s3://x/raw"));
+        j.reset_destination("p", &binding("s3://y/raw", "size"), &dests(), true)
+            .unwrap();
+        assert_eq!(states(&j, "u"), [("a".into(), "pending".into())]);
+        assert!(
+            j.bind_destinations("p", &[binding("s3://y/raw", "size")], &dests())
+                .unwrap()
+                .is_empty()
+        );
+
+        copy_all(&mut j, "u", &["a"]);
+        j.accept_destination("p", &binding("s3://z/raw", "size")).unwrap();
+        assert!(
+            j.bind_destinations("p", &[binding("s3://z/raw", "size")], &dests())
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            states(&j, "u"),
+            [("a".into(), "uploaded".into())],
+            "accepting keeps the copies"
+        );
+    }
+
+    #[test]
+    fn stronger_verification_sends_what_it_did_not_cover_again() {
+        let mut j = Journal::in_memory().unwrap();
+        j.apply_scan("p", &scan(vec![unit("u", &[("a", 1, 1)])], None), 1.0, &dests())
+            .unwrap();
+        copy_all(&mut j, "u", &["a", "b"]);
+        j.bind_destinations("p", &[binding("s3://x", "size")], &dests())
+            .unwrap();
+
+        j.bind_destinations("p", &[binding("s3://x", "sha256")], &dests())
+            .unwrap();
+        assert_eq!(states(&j, "u"), [("a".into(), "pending".into())]);
+        // Weaker again: sha256-verified copies satisfy size.
+        copy_all(&mut j, "u", &["a"]);
+        j.bind_destinations("p", &[binding("s3://x", "size")], &dests())
+            .unwrap();
+        assert_eq!(states(&j, "u"), [("a".into(), "uploaded".into())]);
     }
 
     #[test]

@@ -207,6 +207,41 @@ fn operators_can_complete_abandon_and_retry_units() {
 }
 
 #[test]
+fn a_destination_that_moved_waits_for_an_operator() {
+    let site = Site::new("    upload: file\n    unit_idle: 2h\n", "");
+    write(&site.path("src/u__1/a.tif"), b"alpha");
+    ferry(&site.config).arg("run").assert().success();
+    assert_eq!(files_under(&site.path("remote")), tree(&[("u__1/a.tif", b"alpha")]));
+
+    let text = std::fs::read_to_string(&site.config)
+        .unwrap()
+        .replace("{url: remote}", "{url: elsewhere}");
+    std::fs::write(&site.config, text).unwrap();
+    std::fs::create_dir_all(site.path("elsewhere")).unwrap();
+    ferry(&site.config)
+        .arg("run")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("ferry destination accept inst remote"));
+
+    ferry(&site.config)
+        .args(["destination", "reset", "inst", "remote", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("[dry run] inst/remote points at")
+                .and(predicate::str::contains("1 file(s) go up again")),
+        );
+    ferry(&site.config).arg("run").assert().failure();
+    ferry(&site.config)
+        .args(["destination", "reset", "inst", "remote"])
+        .assert()
+        .success();
+    ferry(&site.config).arg("run").assert().success();
+    assert_eq!(files_under(&site.path("elsewhere")), tree(&[("u__1/a.tif", b"alpha")]));
+}
+
+#[test]
 fn schedule_lists_the_next_passes_in_the_pipeline_zone() {
     let site = Site::new("    mode: cron\n    cron: '0 2 * * *'\n    timezone: Europe/Oslo\n", "");
     let out = ferry(&site.config).args(["schedule", "-n", "2"]).assert().success();

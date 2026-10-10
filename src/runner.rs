@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 use crate::config::{Config, Mode};
 use crate::engine::{self, BoundRegistrar, Engine, EngineParts, PassReport};
 use crate::hooks::{Alerts, ExecHook, Notifier, Registrar, exec_hook, notifier_from, registrar_from};
-use crate::journal::Journal;
+use crate::journal::{Binding, Journal};
 use crate::lock::StateLock;
 use crate::logs::{ship_logs, write_heartbeat};
 use crate::manifest::EventKind;
@@ -125,6 +125,15 @@ impl Agent {
                 destinations,
                 registrars,
                 notifiers: receipts.clone(),
+                bindings: p
+                    .destinations
+                    .iter()
+                    .map(|d| Binding {
+                        name: d.key().to_string(),
+                        identity: config.destination_identity(p, d),
+                        verify: d.verify.as_str().into(),
+                    })
+                    .collect(),
                 journal: journal.clone(),
                 alerts: alerts.clone(),
                 dry_run,

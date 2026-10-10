@@ -337,6 +337,80 @@ impl StoreConfig {
     pub fn is_s3(&self) -> bool {
         self.url.starts_with("s3://")
     }
+
+    /// Where objects under `prefix` in this store live.
+    fn namespace(&self, prefix: &str) -> Namespace {
+        let extra = prefix_parts(prefix);
+        if self.is_s3() {
+            let rest = &self.url["s3://".len()..];
+            let (bucket, base) = rest.split_once('/').unwrap_or((rest, ""));
+            let mut path = prefix_parts(base);
+            path.extend(extra);
+            Namespace::S3 {
+                bucket: bucket.to_string(),
+                endpoint: self
+                    .endpoint
+                    .as_deref()
+                    .map(|e| e.trim_end_matches('/').to_ascii_lowercase()),
+                path,
+            }
+        } else {
+            let mut dir = PathBuf::from(&self.url);
+            dir.extend(extra);
+            Namespace::Local(dir)
+        }
+    }
+}
+
+fn prefix_parts(prefix: &str) -> Vec<String> {
+    prefix
+        .split(['/', '\\'])
+        .filter(|p| !p.is_empty() && *p != ".")
+        .map(str::to_string)
+        .collect()
+}
+
+/// A place objects are written: a bucket (at an endpoint) and a key path in
+/// it, or a local directory.
+#[derive(Debug, Clone, PartialEq)]
+enum Namespace {
+    S3 {
+        bucket: String,
+        endpoint: Option<String>,
+        path: Vec<String>,
+    },
+    Local(PathBuf),
+}
+
+impl Namespace {
+    /// One holds the other, so objects could collide.
+    fn overlaps(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::S3 { bucket, endpoint, path },
+                Self::S3 {
+                    bucket: b,
+                    endpoint: e,
+                    path: p,
+                },
+            ) => bucket == b && endpoint == e && (path.starts_with(p) || p.starts_with(path)),
+            (Self::Local(a), Self::Local(b)) => inside(a, b) || inside(b, a),
+            _ => false,
+        }
+    }
+
+    fn identity(&self) -> String {
+        match self {
+            Self::S3 { bucket, endpoint, path } => {
+                let at = format!("s3://{bucket}/{}", path.join("/"));
+                match endpoint {
+                    Some(endpoint) => format!("{at} via {endpoint}"),
+                    None => at,
+                }
+            }
+            Self::Local(dir) => dir.display().to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1019,7 +1093,7 @@ impl Config {
                 }
             }
         }
-        Ok(())
+        self.validate_places()
     }
 
     fn validate_pipeline(&self, p: &PipelineConfig, at: &dyn Fn(&str) -> String) -> Result<()> {
@@ -1150,6 +1224,64 @@ impl Config {
 
     pub fn journal_path(&self) -> PathBuf {
         self.state_dir.join("journal.sqlite3")
+    }
+
+    /// Where a destination's objects live (bucket, endpoint and key prefix, or
+    /// directory). The journal records it: copies made at one place do not
+    /// count at another.
+    pub fn destination_identity(&self, p: &PipelineConfig, d: &DestinationConfig) -> String {
+        self.stores[&d.store].namespace(&p.prefix_for(d)).identity()
+    }
+
+    /// No two destinations (or log shipping) may write where the other does,
+    /// and nothing ferry writes locally may sit in a watched root.
+    fn validate_places(&self) -> Result<()> {
+        let mut places: Vec<(String, Namespace)> = Vec::new();
+        for p in &self.pipelines {
+            for d in &p.destinations {
+                let place = self.stores[&d.store].namespace(&p.prefix_for(d));
+                places.push((format!("pipeline {} destination {}", p.name, d.key()), place));
+            }
+        }
+        if let Some(ship) = &self.logs.ship {
+            places.push(("logs.ship".into(), self.stores[&ship.store].namespace(&ship.prefix)));
+        }
+        for (i, (a, x)) in places.iter().enumerate() {
+            for (b, y) in &places[i + 1..] {
+                if x.overlaps(y) {
+                    bail!(
+                        "{a} and {b} write to overlapping places ({} and {}); give each its own prefix",
+                        x.identity(),
+                        y.identity()
+                    );
+                }
+            }
+        }
+        for p in &self.pipelines {
+            let mut local: Vec<(String, PathBuf)> = vec![
+                ("state_dir".into(), self.state_dir.clone()),
+                ("logs.dir".into(), self.log_dir()),
+            ];
+            for (name, store) in self.stores.iter().filter(|(_, s)| !s.is_s3()) {
+                local.push((format!("store {name}"), PathBuf::from(&store.url)));
+            }
+            for other in &self.pipelines {
+                if let Some(backup) = &other.finalize.backup_root {
+                    local.push((format!("pipeline {}'s backup_root", other.name), backup.clone()));
+                }
+            }
+            for (what, dir) in local {
+                if inside(&dir, &p.root) || inside(&p.root, &dir) {
+                    bail!(
+                        "pipeline {}: {what} ({}) and the root must not contain each other \
+                         (ferry would ship what it writes)",
+                        p.name,
+                        dir.display()
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1284,6 +1416,59 @@ mod tests {
         assert_eq!(retry.backoff(1), 30.0);
         assert_eq!(retry.backoff(2), 60.0);
         assert_eq!(retry.backoff(10), 3600.0);
+    }
+
+    #[test]
+    fn nothing_writes_where_something_else_does() {
+        let two = |a: &str, b: &str, extra: &str| {
+            Config::from_yaml(
+                &format!(
+                    "state_dir: /tmp/ferry-test-state\n\
+                     stores:\n  raw: {{url: 's3://bucket/raw'}}\n  bucket: {{url: 's3://bucket'}}\n  \
+                     rgw: {{url: 's3://bucket', endpoint: 'https://rgw.lab/'}}\n\
+                     pipelines:\n\
+                     \x20 - {{name: a, root: /tmp/ferry-a, destinations: [{a}]}}\n\
+                     \x20 - {{name: b, root: /tmp/ferry-b, destinations: [{b}]}}\n{extra}"
+                ),
+                &base(),
+            )
+        };
+        let err = two("raw", "bucket", "").unwrap_err().to_string();
+        assert!(
+            err.contains("overlapping places (s3://bucket/raw and s3://bucket/)"),
+            "{err}"
+        );
+        assert!(two("raw", "raw", "").is_err());
+        two("{store: raw, prefix: x}", "{store: raw, prefix: y}", "").unwrap();
+        two("raw", "rgw", "").unwrap();
+        let shipped = two(
+            "raw",
+            "{store: bucket, prefix: b}",
+            "logs: {ship: {store: bucket, prefix: raw/_ferry}}\n",
+        );
+        assert!(shipped.unwrap_err().to_string().contains("logs.ship"));
+
+        let cfg = two("raw", "rgw", "").unwrap();
+        let (p, d) = (&cfg.pipelines[1], &cfg.pipelines[1].destinations[0]);
+        assert_eq!(cfg.destination_identity(p, d), "s3://bucket/ via https://rgw.lab");
+    }
+
+    #[test]
+    fn a_local_store_may_not_sit_in_a_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("data");
+        std::fs::create_dir_all(root.join("copies")).unwrap();
+        let err = Config::from_yaml(
+            &format!(
+                "state_dir: state\nstores: {{here: {{url: '{}'}}}}\npipelines:\n  - {{name: a, root: '{}', destinations: [here]}}\n",
+                root.join("copies").display(),
+                root.display()
+            ),
+            dir.path(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("store here"), "{err}");
     }
 
     #[test]

@@ -23,7 +23,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use futures::StreamExt;
 use futures::future::join_all;
 use object_store::ObjectStore;
@@ -35,7 +35,7 @@ use tokio_util::sync::CancellationToken;
 use crate::config::{Action, Fanout, Level, PipelineConfig, Upload, Verify};
 use crate::hooks::{Alerts, Notifier, Registrar};
 use crate::journal::{
-    COMPLETE, Candidate, FINALIZED, FileRow, Journal, NewTransfer, OPEN, OutboxRow, REGISTERED, REGISTERING,
+    Binding, COMPLETE, Candidate, FINALIZED, FileRow, Journal, NewTransfer, OPEN, OutboxRow, REGISTERED, REGISTERING,
     ScanChanges, TransferRow, UPLOADED, UnitRow, summarize,
 };
 use crate::manifest::{
@@ -215,6 +215,8 @@ pub struct EngineParts {
     pub registrars: Vec<BoundRegistrar>,
     /// The notifiers that take receipts.
     pub notifiers: Vec<Arc<dyn Notifier>>,
+    /// Where each destination points, checked against the journal.
+    pub bindings: Vec<Binding>,
     pub journal: Arc<Mutex<Journal>>,
     pub alerts: Arc<Alerts>,
     pub dry_run: bool,
@@ -251,11 +253,29 @@ impl Engine {
             .filter(|d| d.required)
             .map(|d| d.key.clone())
             .collect();
-        parts
-            .journal
-            .lock()
-            .map_err(|_| anyhow!("journal lock poisoned"))?
-            .ensure_copies(&parts.cfg.name, &all_keys)?;
+        {
+            let mut journal = parts.journal.lock().map_err(|_| anyhow!("journal lock poisoned"))?;
+            let moved = journal.bind_destinations(&parts.cfg.name, &parts.bindings, &all_keys)?;
+            if !moved.is_empty() {
+                let pipeline = &parts.cfg.name;
+                let lines: Vec<String> = moved
+                    .iter()
+                    .map(|m| {
+                        format!(
+                            "destination {name} now points at {now}, but its copies were made at {was}. \
+                             If the objects are there too, run `ferry destination accept {pipeline} {name}`; \
+                             to send what is not yet finalized again, `ferry destination reset {pipeline} {name}` \
+                             (either with --dry-run first).",
+                            name = m.name,
+                            now = m.now,
+                            was = m.was,
+                        )
+                    })
+                    .collect();
+                bail!("pipeline {pipeline}: {}", lines.join(" "));
+            }
+            journal.ensure_copies(&parts.cfg.name, &all_keys)?;
+        }
         let started = parts.clock.now();
         Ok(Self {
             name: parts.cfg.name.clone(),
