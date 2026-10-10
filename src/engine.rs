@@ -36,7 +36,7 @@ use crate::config::{Action, Fanout, Level, PipelineConfig, Upload, Verify};
 use crate::hooks::{Alerts, Notifier, Registrar};
 use crate::journal::{
     COMPLETE, Candidate, FINALIZED, FileRow, Journal, NewTransfer, OPEN, OutboxRow, REGISTERED, REGISTERING,
-    ScanChanges, TransferRow, UPLOADED, UnitRow,
+    ScanChanges, TransferRow, UPLOADED, UnitRow, summarize,
 };
 use crate::manifest::{
     Alert, Event, EventKind, FileCopy, Manifest, ManifestDestination, ManifestFile, Original, Receipt, ReceiptCopy,
@@ -361,15 +361,56 @@ impl Engine {
                 "unit {key} vanished before any of it was uploaded"
             );
         }
-        if scan.errors > 0 {
-            tracing::debug!(pipeline, "{} entries could not be read", scan.errors);
+        for (key, why) in &changes.unreadable {
+            tracing::warn!(pipeline, unit = key.as_str(), "cannot read all of {key}: {why}");
+            self.alerts.emit(Alert {
+                level: Level::Warning,
+                title: format!("{pipeline}: cannot read all of {key}; it waits until it can"),
+                message: why.clone(),
+                pipeline: Some(self.name.clone()),
+                unit: Some(key.clone()),
+            });
+        }
+        if scan.scope.is_none() {
+            self.track_scan_errors(&scan.errors)?;
         }
         Ok(changes)
+    }
+
+    /// Alert when a full scan first cannot read part of the tree outside any
+    /// unit (where no unit then counts as gone), and log when it can again.
+    fn track_scan_errors(&self, errors: &[String]) -> Result<()> {
+        let key = format!("scan_errors:{}", self.name);
+        let before = self.db().get_meta(&key)?.filter(|s| !s.is_empty());
+        let now = summarize(errors);
+        let root = self.cfg.root.display();
+        let pipeline = self.name.as_str();
+        match (&before, now.is_empty()) {
+            (None, false) => {
+                tracing::warn!(pipeline, "cannot read all of {root}: {now}");
+                self.alerts.emit(Alert {
+                    level: Level::Warning,
+                    title: format!("{pipeline}: cannot read all of {root}; no unit counts as gone meanwhile"),
+                    message: now.clone(),
+                    pipeline: Some(self.name.clone()),
+                    unit: None,
+                });
+            }
+            (Some(_), true) => tracing::info!(pipeline, "{root} reads in full again"),
+            _ => {}
+        }
+        if before.as_deref().unwrap_or_default() != now {
+            self.db().set_meta(&key, &now)?;
+        }
+        Ok(())
     }
 
     // -- completion ---------------------------------------------------------
     /// Why `unit` is not complete yet, or `None` if it is.
     fn why_open(&self, unit: &UnitRow, files: &[FileRow], now: f64) -> Option<String> {
+        if let Some(why) = &unit.scan_error {
+            return Some(format!("cannot read all of it: {why}"));
+        }
         if files.is_empty() {
             return Some("no files yet".into());
         }
@@ -871,7 +912,10 @@ impl Engine {
         let units = self.db().units(&self.name, Some(&[COMPLETE]))?;
         for unit in units {
             let files: Vec<FileRow> = self.db().files(unit.id)?.into_iter().filter(FileRow::live).collect();
-            if files.is_empty() || !self.db().copies_current(unit.id, &self.required_keys)? {
+            if unit.scan_error.is_some()
+                || files.is_empty()
+                || !self.db().copies_current(unit.id, &self.required_keys)?
+            {
                 continue;
             }
             let manifest = self.manifest(&unit, &files)?;
@@ -1149,7 +1193,7 @@ impl Engine {
 
     // -- finalize -----------------------------------------------------------
     fn finalize_due_at(&self, unit: &UnitRow) -> Result<Option<f64>> {
-        if !self.db().copies_current(unit.id, &self.all_keys)? {
+        if unit.scan_error.is_some() || !self.db().copies_current(unit.id, &self.all_keys)? {
             return Ok(None);
         }
         let grace = self.cfg.finalize.after.map_or(0.0, |d| d.as_secs_f64());
@@ -1461,6 +1505,12 @@ impl Engine {
                         Some(why) if !files.is_empty() => format!("waiting: {why}"),
                         _ => continue,
                     }
+                }
+                COMPLETE | REGISTERED if unit.scan_error.is_some() => {
+                    format!(
+                        "waiting: cannot read all of it: {}",
+                        unit.scan_error.as_deref().unwrap_or_default()
+                    )
                 }
                 COMPLETE | REGISTERED => {
                     let gate: &[String] = if unit.state == COMPLETE {

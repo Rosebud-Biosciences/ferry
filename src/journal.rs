@@ -43,7 +43,7 @@ pub const PENDING: &str = "pending";
 pub const UPLOADED: &str = "uploaded";
 pub const DONE: &str = "done";
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS unit (
@@ -66,6 +66,7 @@ CREATE TABLE IF NOT EXISTS unit (
     alerted INTEGER NOT NULL DEFAULT 0,
     note TEXT,
     receipt_gen INTEGER,
+    scan_error TEXT,
     UNIQUE (pipeline, key)
 );
 CREATE INDEX IF NOT EXISTS unit_by_state ON unit (pipeline, state);
@@ -174,6 +175,9 @@ pub struct UnitRow {
     pub alerted: bool,
     pub note: Option<String>,
     pub receipt_gen: Option<i64>,
+    /// Why the last scan could not read all of the unit; it neither
+    /// completes, registers nor finalizes until a scan can.
+    pub scan_error: Option<String>,
 }
 
 impl UnitRow {
@@ -198,6 +202,7 @@ impl UnitRow {
             alerted: r.get("alerted")?,
             note: r.get("note")?,
             receipt_gen: r.get("receipt_gen")?,
+            scan_error: r.get("scan_error")?,
         })
     }
 }
@@ -388,6 +393,8 @@ pub struct ScanChanges {
     pub gone_files: Vec<String>,
     pub reopened: Vec<(String, String)>,
     pub gone_units: Vec<String>,
+    /// Units the scan newly could not read in full, and why.
+    pub unreadable: Vec<(String, String)>,
 }
 
 /// A file ready to upload, and the destinations that still need it.
@@ -432,17 +439,37 @@ const UNIT_COLUMNS: &[&str] = &[
     "note",
 ];
 
-/// Version 2 records which generation of each unit had its receipt queued.
-/// Units registered or finalized before the upgrade count as announced, so an
-/// upgrade never sends receipts for them.
-fn migrate_to_2(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
-        "BEGIN;
-         ALTER TABLE unit ADD COLUMN receipt_gen INTEGER;
-         UPDATE unit SET receipt_gen = generation WHERE state IN ('registered', 'finalized');
-         UPDATE meta SET value = '2' WHERE key = 'schema_version';
-         COMMIT;",
+/// Bring a journal at schema `from` up to [`SCHEMA_VERSION`], in one
+/// transaction. Runs before [`SCHEMA`], whose indexes may need new columns.
+fn migrate(conn: &Connection, from: i64) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    if from < 2 {
+        // Which generation of each unit had its receipt queued. Units already
+        // registered or finalized count as announced, so an upgrade never
+        // sends receipts for them.
+        add_column(&tx, "unit", "receipt_gen", "INTEGER")?;
+        tx.execute_batch("UPDATE unit SET receipt_gen = generation WHERE state IN ('registered', 'finalized');")?;
+    }
+    if from < 3 {
+        add_column(&tx, "unit", "scan_error", "TEXT")?;
+    }
+    tx.execute(
+        "UPDATE meta SET value = ? WHERE key = 'schema_version'",
+        [SCHEMA_VERSION.to_string()],
     )?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn add_column(conn: &Connection, table: &str, column: &str, declaration: &str) -> Result<()> {
+    let present: i64 = conn.query_row(
+        &format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = ?"),
+        [column],
+        |r| r.get(0),
+    )?;
+    if present == 0 {
+        conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {declaration};"))?;
+    }
     Ok(())
 }
 
@@ -492,8 +519,7 @@ impl Journal {
                 newer if newer > SCHEMA_VERSION => {
                     bail!("the journal has schema {v}; this ferry understands {SCHEMA_VERSION} -- upgrade ferry");
                 }
-                // Before SCHEMA, whose indexes need the new column.
-                1 => migrate_to_2(&conn)?,
+                older if older < SCHEMA_VERSION => migrate(&conn, older)?,
                 _ => {}
             }
         }
@@ -634,19 +660,42 @@ impl Journal {
                 .map(|r| r.map(|u| (u.key.clone(), u)))
                 .collect::<rusqlite::Result<_>>()?
         };
+        // An unattributed error could hide any unit's files.
+        let everywhere = scan.unattributed.then(|| summarize(&scan.errors));
         for (key, obs) in &scan.units {
-            observe_unit(&tx, pipeline, known.get(key), obs, now, dests, &mut changes)?;
+            let error = everywhere
+                .clone()
+                .or_else(|| (!obs.errors.is_empty()).then(|| summarize(&obs.errors)));
+            observe_unit(
+                &tx,
+                pipeline,
+                known.get(key),
+                obs,
+                error.as_deref(),
+                now,
+                dests,
+                &mut changes,
+            )?;
         }
-        let unseen: Vec<&UnitRow> = match &scan.scope {
-            None => known.values().filter(|u| !scan.units.contains_key(&u.key)).collect(),
-            Some(scope) => scope
-                .iter()
-                .filter(|k| !scan.units.contains_key(*k))
-                .filter_map(|k| known.get(k))
-                .collect(),
-        };
-        for unit in unseen {
-            unit_missing(&tx, unit, &mut changes)?;
+        if let Some(why) = &everywhere {
+            for unit in known.values().filter(|u| !scan.units.contains_key(&u.key)) {
+                if ACTIVE.contains(&unit.state.as_str()) {
+                    mark_unreadable(&tx, unit, why, &mut changes)?;
+                }
+            }
+        } else if scan.errors.is_empty() {
+            // Only a complete look can tell that a unit is gone.
+            let unseen: Vec<&UnitRow> = match &scan.scope {
+                None => known.values().filter(|u| !scan.units.contains_key(&u.key)).collect(),
+                Some(scope) => scope
+                    .iter()
+                    .filter(|k| !scan.units.contains_key(*k))
+                    .filter_map(|k| known.get(k))
+                    .collect(),
+            };
+            for unit in unseen {
+                unit_missing(&tx, unit, &mut changes)?;
+            }
         }
         tx.commit()?;
         Ok(changes)
@@ -1311,11 +1360,32 @@ fn reopen(conn: &Connection, unit_id: i64, reason: &str) -> rusqlite::Result<()>
     Ok(())
 }
 
+/// The first error, and how many more there were.
+pub fn summarize(errors: &[String]) -> String {
+    match errors {
+        [] => String::new(),
+        [only] => only.clone(),
+        [first, rest @ ..] => format!("{first} (and {} more)", rest.len()),
+    }
+}
+
+fn mark_unreadable(tx: &Connection, unit: &UnitRow, why: &str, changes: &mut ScanChanges) -> Result<()> {
+    tx.execute("UPDATE unit SET scan_error = ? WHERE id = ?", params![why, unit.id])?;
+    if unit.scan_error.is_none() {
+        changes.unreadable.push((unit.key.clone(), why.to_string()));
+    }
+    Ok(())
+}
+
+/// Fold one unit's observation in. With `error`, the observation is partial:
+/// what it saw counts, but nothing it did not see counts as gone.
+#[allow(clippy::too_many_arguments)]
 fn observe_unit(
     tx: &Connection,
     pipeline: &str,
     unit: Option<&UnitRow>,
     obs: &UnitObs,
+    error: Option<&str>,
     now: f64,
     dests: &[String],
     changes: &mut ScanChanges,
@@ -1328,18 +1398,37 @@ fn observe_unit(
     let (unit_id, state, existing) = match unit {
         None => {
             tx.execute(
-                "INSERT INTO unit (pipeline, key, first_seen, last_change, marker) VALUES (?, ?, ?, ?, ?)",
-                params![pipeline, obs.key, now, newest, obs.marker],
+                "INSERT INTO unit (pipeline, key, first_seen, last_change, marker, scan_error) \
+                 VALUES (?, ?, ?, ?, ?, ?)",
+                params![pipeline, obs.key, now, newest, obs.marker, error],
             )?;
             changes.new_units.push(obs.key.clone());
+            if let Some(why) = error {
+                changes.unreadable.push((obs.key.clone(), why.to_string()));
+            }
             (tx.last_insert_rowid(), OPEN.to_string(), BTreeMap::new())
         }
         Some(u) if u.state == ABANDONED => return Ok(()),
         Some(u) => {
-            tx.execute(
-                "UPDATE unit SET last_change = ?, marker = ?, present = 1 WHERE id = ?",
-                params![newest, obs.marker, u.id],
-            )?;
+            match error {
+                Some(why) => {
+                    // Part of it unread: never move activity back, never lose a marker.
+                    tx.execute(
+                        "UPDATE unit SET last_change = MAX(last_change, ?), marker = MAX(marker, ?), \
+                         present = 1, scan_error = ? WHERE id = ?",
+                        params![newest, obs.marker, why, u.id],
+                    )?;
+                    if u.scan_error.is_none() {
+                        changes.unreadable.push((obs.key.clone(), why.to_string()));
+                    }
+                }
+                None => {
+                    tx.execute(
+                        "UPDATE unit SET last_change = ?, marker = ?, present = 1, scan_error = NULL WHERE id = ?",
+                        params![newest, obs.marker, u.id],
+                    )?;
+                }
+            }
             let mut stmt = tx.prepare_cached("SELECT * FROM file WHERE unit_id = ?")?;
             let files = stmt
                 .query_map([u.id], FileRow::from_row)?
@@ -1348,7 +1437,7 @@ fn observe_unit(
             (u.id, u.state.clone(), files)
         }
     };
-    let mut reason = observe_files(tx, unit_id, obs, existing, dests, changes)?;
+    let mut reason = observe_files(tx, unit_id, obs, existing, error.is_none(), dests, changes)?;
     if state == GONE && !obs.files.is_empty() {
         reason = reason.or_else(|| Some("reappeared".into()));
     }
@@ -1361,12 +1450,14 @@ fn observe_unit(
     Ok(())
 }
 
-/// Update a unit's file rows; return why completion no longer holds.
+/// Update a unit's file rows; return why completion no longer holds. Only a
+/// `complete` observation can tell that a file is gone.
 fn observe_files(
     tx: &Connection,
     unit_id: i64,
     obs: &UnitObs,
     mut existing: BTreeMap<String, FileRow>,
+    complete: bool,
     dests: &[String],
     changes: &mut ScanChanges,
 ) -> Result<Option<String>> {
@@ -1425,6 +1516,9 @@ fn observe_files(
                 refresh_file(tx, row.id, dests)?;
             }
         }
+    }
+    if !complete {
+        return Ok(reason);
     }
     for row in existing.values() {
         if !row.present {
@@ -1516,7 +1610,7 @@ mod tests {
         Scan {
             units: units.into_iter().map(|u| (u.key.clone(), u)).collect(),
             scope: scope.map(|s| s.iter().map(|k| k.to_string()).collect()),
-            errors: 0,
+            ..Default::default()
         }
     }
 
@@ -1759,6 +1853,64 @@ mod tests {
     }
 
     #[test]
+    fn a_partial_look_keeps_what_it_did_not_see() {
+        let mut j = Journal::in_memory().unwrap();
+        j.apply_scan(
+            "p",
+            &scan(vec![unit("u", &[("a", 1, 1), ("b", 1, 1)])], None),
+            1.0,
+            &dests(),
+        )
+        .unwrap();
+        let mut partial = unit("u", &[("a", 1, 1)]);
+        partial.errors.push("cannot list /r/u/sub: Permission denied".into());
+
+        let changes = j.apply_scan("p", &scan(vec![partial], None), 2.0, &dests()).unwrap();
+        assert_eq!(
+            changes.unreadable,
+            [("u".to_string(), "cannot list /r/u/sub: Permission denied".to_string())]
+        );
+        assert!(changes.gone_files.is_empty());
+        assert_eq!(
+            states(&j, "u"),
+            [("a".into(), "pending".into()), ("b".into(), "pending".into())]
+        );
+        assert!(j.find_unit("p", "u").unwrap().unwrap().scan_error.is_some());
+
+        // Seen in full again: the error clears, and only now is b gone.
+        let changes = j
+            .apply_scan("p", &scan(vec![unit("u", &[("a", 1, 1)])], None), 3.0, &dests())
+            .unwrap();
+        assert_eq!(changes.gone_files, ["u/b"]);
+        assert!(j.find_unit("p", "u").unwrap().unwrap().scan_error.is_none());
+    }
+
+    #[test]
+    fn nothing_is_gone_after_a_scan_that_could_not_see_everything() {
+        let mut j = Journal::in_memory().unwrap();
+        j.apply_scan("p", &scan(vec![unit("u", &[("a", 1, 1)])], None), 1.0, &dests())
+            .unwrap();
+        let blind = Scan {
+            errors: vec!["cannot list /r: Input/output error".into()],
+            ..Default::default()
+        };
+        let changes = j.apply_scan("p", &blind, 2.0, &dests()).unwrap();
+        assert!(changes.gone_files.is_empty() && changes.gone_units.is_empty());
+        assert!(j.find_unit("p", "u").unwrap().unwrap().present);
+        assert_eq!(states(&j, "u"), [("a".into(), "pending".into())]);
+
+        // An error a regex layout cannot place could hide any unit's files.
+        let everywhere = Scan {
+            errors: vec!["cannot list /r/x: Permission denied".into()],
+            unattributed: true,
+            ..Default::default()
+        };
+        let changes = j.apply_scan("p", &everywhere, 3.0, &dests()).unwrap();
+        assert_eq!(changes.unreadable.len(), 1);
+        assert!(j.find_unit("p", "u").unwrap().unwrap().scan_error.is_some());
+    }
+
+    #[test]
     fn each_generation_of_a_unit_is_announced_once() {
         let mut j = Journal::in_memory().unwrap();
         j.apply_scan("p", &scan(vec![unit("u", &[("a", 1, 1)])], None), 1.0, &dests())
@@ -1811,7 +1963,7 @@ mod tests {
             .unwrap();
 
         let j = Journal::open(&path).unwrap();
-        assert_eq!(j.get_meta("schema_version").unwrap().as_deref(), Some("2"));
+        assert_eq!(j.get_meta("schema_version").unwrap(), Some(SCHEMA_VERSION.to_string()));
         let gen_of = |key: &str| j.find_unit("p", key).unwrap().unwrap().receipt_gen;
         assert_eq!(
             (gen_of("done"), gen_of("waiting"), gen_of("busy")),

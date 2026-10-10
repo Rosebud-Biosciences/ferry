@@ -872,3 +872,134 @@ async fn big_files_go_up_in_parts_to_every_destination() {
     let registered = h.recorder.manifests(Register);
     assert_eq!(registered[0].files[0].sha256.as_deref(), Some(sha256(&body).as_str()));
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_unit_with_a_folder_it_cannot_read_waits_for_it() {
+    let h = Harness::new();
+    let cfg = h.config("");
+    write(&h.src.join("u__1/a.tif"), b"a");
+    write(&h.src.join("u__1/later/b.tif"), b"b");
+    age_tree(&h.src, hour_ago());
+
+    let locked = lock_out(&h.src.join("u__1/later"));
+    let report = h.pass(&cfg).await;
+    let_in(&h.src.join("u__1/later"));
+    if !locked {
+        return;
+    }
+    assert!(report.registered.is_empty());
+    assert!(
+        report.waiting["u__1"].contains("cannot read all of it"),
+        "{:?}",
+        report.waiting
+    );
+    assert!(data_files(&h.remote).is_empty());
+
+    h.pass(&cfg).await;
+    let registered = h.recorder.manifests(Register);
+    assert_eq!(
+        registered[0].files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(),
+        ["a.tif", "later/b.tif"]
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_complete_unit_that_turns_unreadable_does_not_register() {
+    let h = Harness::new();
+    let cfg = h.config("");
+    write(&h.src.join("u__1/a.tif"), b"a");
+    std::fs::create_dir_all(h.src.join("u__1/later")).unwrap();
+    age_tree(&h.src, hour_ago());
+    block(&h.remote, "u__1");
+    h.pass(&cfg).await;
+    assert_eq!(h.unit_state(&cfg, "u__1").as_deref(), Some("complete"));
+
+    // A file lands where the next scan cannot look; a.tif stays as it was.
+    write(&h.src.join("u__1/later/b.tif"), b"b");
+    unblock(&h.remote, "u__1");
+    h.clock.advance(31.0);
+    let locked = lock_out(&h.src.join("u__1/later"));
+    let report = h.pass(&cfg).await;
+    let_in(&h.src.join("u__1/later"));
+    if !locked {
+        return;
+    }
+    assert!(report.registered.is_empty(), "never with a partial file list");
+
+    h.pass(&cfg).await;
+    let registered = h.recorder.manifests(Register);
+    assert_eq!(
+        registered[0].files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(),
+        ["a.tif", "later/b.tif"]
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_registered_unit_that_turns_unreadable_is_not_finalized() {
+    let h = Harness::new();
+    let cfg = h.config("    finalize: {action: delete, after: 1h}\n");
+    write(&h.src.join("u__1/a.tif"), b"a");
+    write(&h.src.join("u__1/later/b.tif"), b"b");
+    age_tree(&h.src, hour_ago());
+    h.pass(&cfg).await;
+    assert_eq!(h.unit_state(&cfg, "u__1").as_deref(), Some("registered"));
+
+    h.clock.advance(3601.0);
+    let locked = lock_out(&h.src.join("u__1/later"));
+    let report = h.pass(&cfg).await;
+    let_in(&h.src.join("u__1/later"));
+    if !locked {
+        return;
+    }
+    assert!(report.finalized.is_empty());
+    assert!(
+        h.src.join("u__1/a.tif").exists(),
+        "nothing goes while part of the unit is unread"
+    );
+
+    h.pass(&cfg).await;
+    assert!(!h.src.join("u__1").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_root_that_cannot_be_listed_makes_nothing_gone() {
+    let h = Harness::new();
+    let cfg = h.config("    unit_idle: 2h\n");
+    write(&h.src.join("u__1/a.tif"), b"a");
+    age_tree(&h.src, hour_ago());
+    h.pass(&cfg).await;
+
+    let locked = lock_out(&h.src);
+    let report = h.pass(&cfg).await;
+    let_in(&h.src);
+    if !locked {
+        return;
+    }
+    assert!(report.reopened.is_empty());
+    let journal = Journal::open(&cfg.journal_path()).unwrap();
+    let unit = journal.find_unit("inst", "u__1").unwrap().unwrap();
+    assert!(unit.present);
+    let files = journal.files(unit.id).unwrap();
+    assert!(files.iter().all(|f| f.present && f.state == "pending"), "{files:?}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn names_with_backslashes_keep_keys_of_their_own() {
+    let h = Harness::new();
+    let cfg = h.config("");
+    write(&h.src.join("u__1/a\\b.tif"), b"one name");
+    write(&h.src.join("u__1/a/b.tif"), b"two names");
+    age_tree(&h.src, hour_ago());
+
+    h.pass(&cfg).await;
+
+    assert_eq!(
+        data_files(&h.remote),
+        tree(&[("u__1/a%5Cb.tif", b"one name"), ("u__1/a/b.tif", b"two names")])
+    );
+}

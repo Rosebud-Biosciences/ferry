@@ -334,6 +334,21 @@ pub fn write(path: &Path, data: &[u8]) -> PathBuf {
     write_at(path, data, hour_ago())
 }
 
+/// Make the directory `path` unreadable; `false` if this process reads it
+/// anyway (as root does), so the caller can skip.
+#[cfg(unix)]
+pub fn lock_out(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000)).unwrap();
+    std::fs::read_dir(path).is_err()
+}
+
+#[cfg(unix)]
+pub fn let_in(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
 /// Backdate every file and directory under (and including) `top`.
 pub fn age_tree(top: &Path, mtime: f64) {
     for entry in walk(top) {
