@@ -1,6 +1,6 @@
 //! The documented example config stays valid.
 
-use ferry::config::{Action, Config, Fanout, Mode, NotifierEvent, Upload, Verify};
+use ferry::config::{Action, Adopt, Config, Fanout, Mode, NotifierEvent, Upload, Verify};
 
 #[test]
 fn the_annotated_example_config_loads() {
@@ -17,6 +17,7 @@ fn the_annotated_example_config_loads() {
     assert_eq!(nightly.destinations[1].verify, Verify::Sha256);
     assert!(!nightly.destinations[1].required);
     assert_eq!(nightly.finalize.action, Action::Move);
+    assert_eq!(nightly.adopt, Adopt::Sha256);
     assert_eq!(nightly.registrars[1].env["CATALOG_URL"], "<CATALOG_URL>");
     assert_eq!(cfg.pipelines[1].finalize.action, Action::Delete);
     assert_eq!(cfg.stores["ceph"].options["aws_access_key_id"], "<FERRY_S3_KEY>");

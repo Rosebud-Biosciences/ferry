@@ -13,6 +13,11 @@ unit to your *registrars* (any command; the event arrives as JSON on stdin),
 and then keeps, moves or deletes the local copies. A local SQLite journal makes
 every step resumable, and every action is logged locally as JSON lines.
 
+ferry is for write-once data: acquisitions that land, settle and are then left
+alone -- from instruments, sensors, cameras and the like. It is not a backup,
+sync or mirror tool for folders whose files keep changing, and it never
+deletes from a store.
+
 > Status: alpha (`0.1.0-alpha.1`). The command is `ferry`; the crate and the
 > PyPI distribution are `ferry-ingest`.
 
@@ -115,22 +120,44 @@ schedulers and testing.
 ## What ferry guarantees
 
 - A copy counts only if the file did not change while it was read (it is
-  stat'd before and after) and the stored object verified. A file that changes
-  later -- even rewritten in place at the same size -- is sent again.
+  stat'd before and after) and the stored object verified. A file whose size
+  or mtime changes later is sent again. ferry tells versions of a file apart
+  by size and mtime; a rewrite that keeps both is caught before a delete,
+  which hashes the file first, and not otherwise.
+- ferry acts only on what it could read. If a scan cannot read part of a unit
+  -- a permission, a share that drops, a name that is not valid Unicode, a
+  symbolic link (links are never followed) -- the unit waits: it does not
+  complete, register or finalize, and nothing the scan missed counts as gone.
+  An alert says what could not be read; `exclude` it if it should not travel.
 - A unit is registered once it is complete and every *required* destination
   holds a verified copy of every file -- never with a partial file list. Files
   that change or appear later reopen the unit and register it again, with a
   higher `generation`.
 - Source files are kept, moved or deleted (`finalize.action: keep | move |
   delete`) only once **every** destination holds a verified copy, every
-  required registrar has confirmed the unit, the `finalize.after` grace period
-  (if any) has passed, and the files still match what was uploaded.
+  required registrar has confirmed the unit, and the `finalize.after` grace
+  period (if any) has passed. Before a move or delete, ferry then:
+  - checks that every copy is still there with the size sent and the ETag
+    recorded when it was verified; one that went missing or was overwritten is
+    sent again first;
+  - sets each file aside by renaming it (`name.ferry-finalizing`), so a writer
+    that comes back makes a new file instead of changing the bytes in flight;
+  - checks the file set aside is the one uploaded -- the same size and mtime,
+    and before a delete the same SHA-256 -- and otherwise puts it back and
+    sends it again;
+  - moves it (hashing it on the way if the backup is on another file system)
+    or deletes it, and records that only while the journal still describes
+    those bytes.
+- Copies are tied to where a destination points: its bucket, endpoint and
+  prefix, or its directory. Change that, and ferry stops until you say what
+  happened (see `ferry destination` below). Strengthening `verify` from `size`
+  to `sha256` sends again what the weaker check covered.
 - Every step is journaled, so a crash, reboot or killed process resumes where
-  it stopped. Before a unit's first upload to a size-verified destination,
-  ferry lists its prefix there and adopts files already present with the same
-  size, so a lost journal never means uploading everything again.
-  (`verify: sha256` destinations never adopt: an object ferry did not hash is
-  sent again.)
+  it stopped -- a move or delete interrupted after the rename included.
+- A lost journal means uploading again, unless the pipeline sets `adopt`.
+  `adopt: sha256` reads back each object already at a destination and counts
+  it if it hashes like the local file. `adopt: size` counts any object with
+  the right key and size, so it is allowed only with `finalize.action: keep`.
 
 ## Stores
 
@@ -143,6 +170,12 @@ setting by name; credentials otherwise come from `profile` (static keys in
 `bandwidth: 50MB` caps a store's rate, optionally per local time window
 (`{"08:00-18:00": 50MB}`). A local or mounted directory (`url: /mnt/nas/raw`)
 also works.
+
+A file goes to `<prefix>/<unit>/<path within the unit>`, its names as the file
+system gives them (no Unicode normalization), each percent-encoded only where a
+key could not hold it faithfully: `%`, `\` and control characters. So `a\b.tif`
+(a legal name on Linux) and `a/b.tif` stay distinct. No two destinations, and
+not log shipping, may write under the same prefix of one bucket or directory.
 
 For **Ceph RGW** (and other self-hosted S3):
 
@@ -189,11 +222,20 @@ JSON); `exec:` runs a command with the event on stdin.
   attempts.
 - `ferry abandon PIPELINE UNIT` stops tracking a unit; its files stay where
   they are.
+- `ferry destination accept PIPELINE DESTINATION` -- a destination's new
+  settings reach the same objects, so its copies keep counting -- or `ferry
+  destination reset PIPELINE DESTINATION` -- they do not, so every file not yet
+  finalized goes up again. ferry refuses to run until one is chosen; both take
+  `--dry-run`.
+- `ferry outbox discard PIPELINE REGISTRAR [--dry-run]` drops the undelivered
+  events of a registrar that was renamed or removed. ferry refuses to run while
+  any wait for one, rather than finalizing units it never registered.
 - Logs go to stderr and to `<state_dir>/logs/ferry.YYYY-MM-DD.jsonl` (UTC
   days), one JSON object per line; `FERRY_LOG=debug` (any `tracing` filter)
   overrides `logs.level`. With `logs.ship`, finished days are copied to a store,
-  `logs.ship.registrars` are told about each, and a heartbeat object with every
-  pipeline's summary is refreshed.
+  `logs.ship.registrars` are told about each (and told again on the next round
+  if they failed), and a heartbeat object with every pipeline's summary is
+  refreshed.
 - `ferry service install` registers a native Windows service (delayed
   automatic start, restarted on failure; run it as administrator, and pass
   `--account` to run as a user that can reach network shares) or a systemd unit

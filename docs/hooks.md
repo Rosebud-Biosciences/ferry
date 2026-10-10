@@ -3,8 +3,9 @@
 ferry tells the rest of your system what it did by running commands. A hook is
 any program, in any language: ferry starts it once per event and writes one
 JSON document to its stdin. Exit code 0 means the event was handled; anything
-else, or running past `timeout`, is a failure. The last 2000 characters of
-stderr become the error that `ferry status` and alerts show.
+else, or running past `timeout`, is a failure. stdout is discarded; the last
+2000 characters of stderr become the error that `ferry status` and alerts show
+(only the end of stderr is ever held, however much a hook writes).
 
 ```yaml
 registrars:
@@ -42,8 +43,16 @@ Registrar events go through a durable outbox in the journal:
   timeout, not one per waiting unit. After `retry.alert_after` failures an
   alert goes to the notifiers.
 
+- **A registrar's events are never dropped on its behalf.** If the config no
+  longer names a registrar that has undelivered events (it was renamed or
+  removed), ferry refuses to run until it is configured again or `ferry outbox
+  discard PIPELINE REGISTRAR` drops them -- otherwise units could finalize
+  that it never registered.
+
 Receipts go to notifiers through the same outbox, retried the same way, but
 they never hold anything up. Alerts are best effort: sent once, not retried.
+`log` events to `logs.ship.registrars` are recorded per registrar when a log
+ships, and offered again each round until the registrar takes them.
 
 ## Events
 

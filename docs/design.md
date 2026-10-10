@@ -96,6 +96,29 @@ or renamed. A completed unit gets a new `generation`. Any later change to it --
 a new file, a rewritten one -- reopens it, so it completes, uploads and
 registers again with a higher generation, never with a partial file list.
 
+**A scan only counts what it could read.** Anything it cannot -- a directory it
+may not list, an entry it cannot stat, a name that is not valid Unicode, a
+symbolic link -- is recorded against the unit it is in (`scan_error`). Such a
+unit keeps the files it had, counts none as gone, and does not complete,
+register or finalize until a scan reads it in full; an alert says why. Errors
+outside any unit (the root itself, a level above the units) mean no unit counts
+as gone that round, since one may be there unseen. With `unit.regex` any error
+could hide any unit's files, so every unit waits. A share that drops therefore
+looks like nothing at all, not like everything deleted.
+
+**Paths.** Names are used as the file system returns them, with no Unicode
+normalization; one that is not valid UTF-8 is a scan error. Symbolic links (and
+Windows junctions) are never followed: a link's target may be anywhere, and
+ferry ships only what is under the root. A key is `<prefix>/<unit>/<within>`,
+joined with `/` from the path's components; each name is percent-encoded where
+a key cannot hold it faithfully (`%`, `\`, control characters), so distinct
+names keep distinct keys and decode back exactly. ferry does not fold case:
+two names differing only in case are two keys, as they are on Linux and in S3.
+Where they would collide -- two destinations, or log shipping, under one prefix
+of one bucket at one endpoint, or of one directory -- the config is rejected,
+as is anything ferry writes locally (state, logs, a local store, a backup root)
+inside a watched root.
+
 ## The journal
 
 ```text
@@ -132,13 +155,24 @@ Recovery after a crash at each point:
   multipart upload overwrites whatever was left).
 - After delivering to a registrar, before recording it: delivered again.
   Registrars are idempotent upserts, which is the contract.
-- Mid-move: across file systems the copy is written under a temporary name and
-  size-checked before the rename and the source delete. A file missing at
-  finalize whose backup copy has the right size is recorded as moved.
-- After a lost journal: adoption lists each unit's prefix at each size-verified
-  destination before its first upload there, and skips files already present
-  with the same size. Hash-verified destinations never adopt, because nothing
-  proves an object ferry did not hash is the same file.
+- Mid-finalize: a file is set aside by a rename before it is moved or
+  deleted, and the next attempt carries on from the file set aside. Across
+  file systems the backup is written under a temporary name and hashed on the
+  way; it must match what was uploaded before the source goes. A file missing
+  at finalize counts as moved only if its backup hashes like the upload;
+  otherwise the unit waits, and alerts.
+- After a lost journal: everything is uploaded again unless `adopt` is set.
+  `adopt: sha256` lists each unit's prefix before its first upload and counts
+  an object only if it reads back with the local file's SHA-256. `adopt: size`
+  counts any object of the right key and size -- some other file of that size
+  would pass -- so it is refused unless source files are kept.
+- A destination's identity (bucket, endpoint and full prefix, or directory)
+  and `verify` are recorded. Copies made at one place are no evidence of
+  another, so a changed identity stops ferry until an operator runs `ferry
+  destination accept` or `reset`. A stronger `verify` sends again what the
+  weaker check covered. Undelivered events for a registrar no longer in the
+  config also stop it, until `ferry outbox discard`: removing a required
+  registrar must not quietly let units finalize.
 
 ## Transfers and fan-out
 
@@ -174,10 +208,30 @@ adds a server-verified whole-object checksum where the server supports it.
 `finalize.action: delete` is the one irreversible step, so it waits for the
 strongest evidence ferry has: every destination (not just the required ones)
 holds a copy that verified at the file's current size and mtime, every
-required registrar has confirmed the unit, `finalize.after` has passed since
-the last copy (time for downstream checks or replication), and the source file
-still has the stats that were uploaded. Any mismatch reopens the unit instead.
+required registrar has confirmed the unit, and `finalize.after` has passed
+since the last copy (time for downstream checks or replication). Then, for a
+move or a delete:
+
+1. **Recheck the copies.** A HEAD of every copy: it must still be there with
+   the size sent and the ETag recorded at verification. One deleted (a
+   lifecycle rule, a person) or overwritten during the grace period is sent
+   again, and the unit registers again, before anything local is touched.
+2. **Set the file aside** by renaming it to `name.ferry-finalizing` in its
+   directory -- atomic, and invisible to scans. A writer that comes back to
+   the name now creates a new file, which is picked up as one.
+3. **Check what was set aside**: the size and mtime that were uploaded and,
+   before a delete, the SHA-256, since a rewrite can keep both. Anything else
+   is put back (under a new name if a new file took the old one) and sent
+   again.
+4. **Act and record.** Delete it, or move it to the backup root (renamed, or
+   copied and hashed across file systems). The journal row is updated only if
+   it still describes those bytes -- a compare-and-set on its size and mtime --
+   so a scan that saw new bytes meanwhile is never overwritten.
+
 `action: move` follows the same gate and keeps the file on a backup drive.
+What it cannot rule out: a process that already holds the file open on Linux
+or macOS can write through the rename. On Windows, the rename fails while a
+writer holds the file, and finalizing waits.
 
 ## Registration: exec hooks
 
