@@ -18,7 +18,11 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use object_store::{ObjectStoreExt, PutPayload};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+/// How much of a hook's stderr is kept (its end); errors show the last 2000
+/// characters of it.
+const STDERR_KEPT: usize = 16 * 1024;
 
 use crate::config::{HookConfig, Level, NotifierConfig, NotifierEvent, WebhookFormat};
 use crate::manifest::{Alert, Event, EventKind, ManifestDoc};
@@ -50,7 +54,7 @@ impl ExecHook {
             .env("FERRY_EVENT", event.event.as_str())
             .env("FERRY_NODE", &event.node)
             .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
+            .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         if let Some(pipeline) = &event.pipeline {
@@ -68,28 +72,47 @@ impl ExecHook {
             let _ = stdin.write_all(&payload).await;
             drop(stdin);
         };
+        let mut stderr = child.stderr.take().context("no stderr")?;
+        let collect = async move {
+            // Only the end is kept, so a chatty hook cannot fill memory.
+            let mut kept: Vec<u8> = Vec::new();
+            let mut buf = [0u8; 8192];
+            while let Ok(n) = stderr.read(&mut buf).await {
+                if n == 0 {
+                    break;
+                }
+                kept.extend_from_slice(&buf[..n]);
+                if kept.len() > STDERR_KEPT {
+                    kept.drain(..kept.len() - STDERR_KEPT);
+                }
+            }
+            kept
+        };
         let finished = tokio::time::timeout(self.timeout, async {
-            let ((), output) = tokio::join!(feed, child.wait_with_output());
-            output
+            let ((), stderr, status) = tokio::join!(feed, collect, child.wait());
+            (stderr, status)
         })
         .await;
-        let output = match finished {
+        let (stderr, status) = match finished {
             Err(_) => bail!(
                 "{}: timed out after {}",
                 self.name,
                 humantime::format_duration(self.timeout)
             ),
-            Ok(output) => output.with_context(|| format!("{}: waiting for {program}", self.name))?,
+            Ok((stderr, status)) => (
+                stderr,
+                status.with_context(|| format!("{}: waiting for {program}", self.name))?,
+            ),
         };
-        if output.status.success() {
+        if status.success() {
             return Ok(());
         }
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = String::from_utf8_lossy(&stderr);
         let detail = tail(stderr.trim(), 2000);
         Err(anyhow!(
             "{}: {} for {}{}",
             self.name,
-            match output.status.code() {
+            match status.code() {
                 Some(code) => format!("exit code {code}"),
                 None => "killed by a signal".into(),
             },
@@ -539,5 +562,23 @@ mod tests {
     #[tokio::test]
     async fn a_hook_may_ignore_its_input() {
         hook("exit 0", Duration::from_secs(10)).run(&event()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_chatty_hook_costs_only_the_end_of_its_stderr() {
+        hook("head -c 20000000 /dev/zero; exit 0", Duration::from_secs(30))
+            .run(&event())
+            .await
+            .unwrap();
+        let err = hook(
+            "i=0; while [ $i -lt 20000 ]; do echo \"noise $i\" >&2; i=$((i+1)); done; echo 'the real reason' >&2; exit 1",
+            Duration::from_secs(30),
+        )
+        .run(&event())
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.ends_with("the real reason"), "{err}");
+        assert!(err.len() < 2200, "{}", err.len());
     }
 }

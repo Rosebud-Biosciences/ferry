@@ -43,7 +43,7 @@ pub const PENDING: &str = "pending";
 pub const UPLOADED: &str = "uploaded";
 pub const DONE: &str = "done";
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS unit (
@@ -155,6 +155,14 @@ CREATE TABLE IF NOT EXISTS shipped_log (
     size INTEGER NOT NULL,
     sha256 TEXT NOT NULL,
     shipped_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS log_delivery (
+    name TEXT NOT NULL REFERENCES shipped_log (name) ON DELETE CASCADE,
+    hook TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    done_at REAL,
+    PRIMARY KEY (name, hook)
 );
 "#;
 
@@ -488,7 +496,8 @@ fn migrate(conn: &Connection, from: i64) -> Result<()> {
         add_column(&tx, "unit", "scan_error", "TEXT")?;
     }
     // 4 adds the `destination` table; the first run after the upgrade records
-    // where each destination points.
+    // where each destination points. 5 adds `log_delivery`: logs shipped
+    // before it were told about once, as before, and are not told again.
     tx.execute(
         "UPDATE meta SET value = ? WHERE key = 'schema_version'",
         [SCHEMA_VERSION.to_string()],
@@ -1552,13 +1561,81 @@ impl Journal {
             .is_some())
     }
 
-    pub fn record_shipped(&self, name: &str, uri: &str, size: i64, sha256: &str, now: f64) -> Result<()> {
-        self.conn.execute(
+    /// Record a log shipped, and that each of `hooks` is yet to be told.
+    pub fn record_shipped(
+        &mut self,
+        name: &str,
+        uri: &str,
+        size: i64,
+        sha256: &str,
+        now: f64,
+        hooks: &[String],
+    ) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
             "INSERT OR REPLACE INTO shipped_log (name, uri, size, sha256, shipped_at) VALUES (?, ?, ?, ?, ?)",
             params![name, uri, size, sha256, now],
         )?;
+        for hook in hooks {
+            tx.execute(
+                "INSERT OR IGNORE INTO log_delivery (name, hook) VALUES (?, ?)",
+                params![name, hook],
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
+
+    /// Shipped logs that one of `hooks` has not taken yet, oldest first.
+    pub fn undelivered_logs(&self, hooks: &[String]) -> Result<Vec<(ShippedRow, String)>> {
+        if hooks.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sql = format!(
+            "SELECT s.name, s.uri, s.size, s.sha256, d.hook FROM log_delivery d \
+             JOIN shipped_log s ON s.name = d.name WHERE d.done_at IS NULL AND d.hook IN ({}) \
+             ORDER BY s.name, d.hook",
+            marks(hooks.len())
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(values(hooks)), |r| {
+            Ok((
+                ShippedRow {
+                    name: r.get(0)?,
+                    uri: r.get(1)?,
+                    size: r.get(2)?,
+                    sha256: r.get(3)?,
+                },
+                r.get(4)?,
+            ))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn log_delivered(&self, name: &str, hook: &str, now: f64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE log_delivery SET done_at = ?, last_error = NULL WHERE name = ? AND hook = ?",
+            params![now, name, hook],
+        )?;
+        Ok(())
+    }
+
+    pub fn log_delivery_failed(&self, name: &str, hook: &str, error: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE log_delivery SET attempts = attempts + 1, last_error = ? WHERE name = ? AND hook = ?",
+            params![error, name, hook],
+        )?;
+        Ok(())
+    }
+}
+
+/// A shipped log, as the journal recorded it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShippedRow {
+    pub name: String,
+    pub uri: String,
+    pub size: i64,
+    pub sha256: String,
 }
 
 // -- scan helpers (inside a transaction) -------------------------------------
