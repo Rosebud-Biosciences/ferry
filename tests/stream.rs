@@ -172,9 +172,21 @@ async fn file_events_wake_a_stream_long_before_its_next_poll() {
     );
 
     let watching = Watching::start(&h, &cfg);
-    tokio::time::sleep(Duration::from_secs(1)).await; // the watcher is running
-    write_at(&h.src.join("u__1/a.tif"), b"data", wall());
-    eventually("the unit registered", Duration::from_secs(30), || registered(&h) == 1).await;
+    // The watcher starts in the background, and an event made before it is
+    // listening is lost. Keep making fresh ones until the file has gone up:
+    // with a 10-minute poll, only an event can get it there in time.
+    let file = h.src.join("u__1/a.tif");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut last_event: Option<Instant> = None;
+    while registered(&h) == 0 {
+        assert!(Instant::now() < deadline, "the unit did not register within 30s");
+        let uploaded = h.remote.join("u__1/a.tif").exists();
+        if !uploaded && last_event.is_none_or(|t| t.elapsed() > Duration::from_secs(3)) {
+            write_at(&file, b"data", wall());
+            last_event = Some(Instant::now());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     watching.stop().await;
 
     assert_eq!(data_files(&h.remote), tree(&[("u__1/a.tif", b"data")]));

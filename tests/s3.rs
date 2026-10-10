@@ -1,7 +1,8 @@
 //! Against a real S3 API: set `FERRY_TEST_S3_ENDPOINT` (CI runs SeaweedFS,
 //! which like Ceph RGW is reached path-style at a custom endpoint),
 //! `FERRY_TEST_S3_KEY`, `FERRY_TEST_S3_SECRET` and `FERRY_TEST_S3_BUCKET` (an
-//! existing bucket). Without them these tests pass vacuously.
+//! existing bucket), and run them with `--include-ignored`; otherwise they
+//! are reported as ignored.
 
 mod common;
 
@@ -28,13 +29,7 @@ fn s3() -> Option<S3> {
 
 macro_rules! require_s3 {
     () => {
-        match s3() {
-            Some(s3) => s3,
-            None => {
-                eprintln!("skipped: set FERRY_TEST_S3_ENDPOINT to run the S3 tests");
-                return;
-            }
-        }
+        s3().expect("set FERRY_TEST_S3_ENDPOINT (and _KEY, _SECRET, _BUCKET) to run the S3 tests")
     };
 }
 
@@ -79,6 +74,7 @@ async fn read(cfg: &ferry::config::Config, rel: &str) -> Vec<u8> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs an S3 endpoint: FERRY_TEST_S3_ENDPOINT"]
 async fn a_pipeline_ships_small_and_multipart_files_to_s3_and_a_mirror() {
     let s3 = require_s3!();
     let h = Harness::new();
@@ -120,6 +116,7 @@ async fn a_pipeline_ships_small_and_multipart_files_to_s3_and_a_mirror() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs an S3 endpoint: FERRY_TEST_S3_ENDPOINT"]
 async fn a_lost_journal_adopts_what_s3_already_holds() {
     let s3 = require_s3!();
     let h = Harness::new();
