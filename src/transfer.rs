@@ -353,6 +353,40 @@ async fn verify(target: &Target, size: u64, sha256: &str) -> Result<Verify, Stri
     Ok(target.verify)
 }
 
+/// A local file's SHA-256, and its size and mtime before and after the read.
+pub struct Hashed {
+    pub sha256: String,
+    pub before: (u64, i64),
+    pub after: (u64, i64),
+}
+
+impl Hashed {
+    /// The file had size and mtime `stats` throughout the read.
+    pub fn steady_at(&self, stats: (u64, i64)) -> bool {
+        self.before == stats && self.after == stats
+    }
+}
+
+pub fn hash_file(path: &Path) -> io::Result<Hashed> {
+    let before = stats(&fs::metadata(path)?);
+    let mut file = fs::File::open(path)?;
+    let mut ctx = digest::Context::new(&digest::SHA256);
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        ctx.update(&buf[..n]);
+    }
+    let after = stats(&fs::metadata(path)?);
+    Ok(Hashed {
+        sha256: sha_hex(ctx.finish()),
+        before,
+        after,
+    })
+}
+
 pub async fn readback_sha256(target: &Target) -> Result<String, String> {
     let key = target.location.key(&target.rel).map_err(describe)?;
     let mut stream = target

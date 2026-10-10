@@ -285,7 +285,7 @@ async fn files_already_in_the_store_are_adopted_not_uploaded_again() {
     age_tree(&h.src, hour_ago());
     write(&h.remote.join("u__1/a.tif"), b"alpha");
     write(&h.remote.join("u__1/b.tif"), b"different size");
-    let cfg = h.config("");
+    let cfg = h.config("    adopt: size\n");
 
     let report = h.pass(&cfg).await;
 
@@ -317,13 +317,54 @@ async fn a_hash_verified_destination_never_adopts_what_it_cannot_check() {
     let cfg = h.config_with(
         "[remote, {store: mirror, verify: sha256}]",
         "[{name: rec, exec: [unused]}]",
-        "",
+        "    adopt: size\n",
     );
 
     let report = h.pass(&cfg).await;
 
     assert_eq!(report.adopted, 0);
     assert_eq!(std::fs::read(h.mirror.join("u__1/a.tif")).unwrap(), b"alpha");
+}
+
+#[tokio::test]
+async fn by_default_an_object_already_there_is_uploaded_over() {
+    let h = Harness::new();
+    write(&h.src.join("u__1/a.tif"), b"alpha");
+    age_tree(&h.src, hour_ago());
+    write(&h.remote.join("u__1/a.tif"), b"ALPHA");
+    let cfg = h.config("");
+
+    let report = h.pass(&cfg).await;
+
+    assert_eq!((report.adopted, report.uploaded), (0, 1));
+    assert_eq!(std::fs::read(h.remote.join("u__1/a.tif")).unwrap(), b"alpha");
+}
+
+#[tokio::test]
+async fn hash_adoption_counts_only_what_reads_back_the_same() {
+    let h = Harness::new();
+    write(&h.src.join("u__1/a.tif"), b"alpha");
+    write(&h.src.join("u__1/b.tif"), b"bravo");
+    age_tree(&h.src, hour_ago());
+    write(&h.remote.join("u__1/a.tif"), b"alpha");
+    write(&h.remote.join("u__1/b.tif"), b"BRAVO");
+    let cfg = h.config(&format!("    adopt: sha256\n{}", h.backup_extra("move")));
+
+    let report = h.pass(&cfg).await;
+
+    assert_eq!((report.adopted, report.uploaded), (1, 1));
+    assert_eq!(std::fs::read(h.remote.join("u__1/b.tif")).unwrap(), b"bravo");
+    let registered = h.recorder.manifests(Register);
+    let verified: Vec<Option<String>> = registered[0]
+        .files
+        .iter()
+        .map(|f| f.copies[0].verified.clone())
+        .collect();
+    assert_eq!(verified, [Some("sha256".into()), Some("size".into())]);
+    assert!(
+        h.backup.join("u__1/a.tif").exists(),
+        "moved on the strength of the readback"
+    );
 }
 
 #[tokio::test]

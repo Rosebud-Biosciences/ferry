@@ -124,7 +124,7 @@ async fn a_lost_journal_adopts_what_s3_already_holds() {
     let s3 = require_s3!();
     let h = Harness::new();
     let prefix = run_prefix();
-    let cfg = s3_config(&h, &s3, &prefix, "[remote]", "");
+    let cfg = s3_config(&h, &s3, &prefix, "[remote]", "    adopt: sha256\n");
     write(&h.src.join("u__1/a.tif"), b"alpha");
     write(&h.src.join("u__1/b.tif"), b"bravo");
     age_tree(&h.src, hour_ago());

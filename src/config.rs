@@ -261,6 +261,42 @@ impl Verify {
     }
 }
 
+/// Whether an object already at a destination (after a lost journal, or a
+/// migration from another uploader) counts as a copy instead of being
+/// uploaded again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Adopt {
+    /// Upload everything.
+    #[default]
+    Off,
+    /// An object with the same key and size counts. Any object of that size
+    /// would pass, so only where source files are kept.
+    Size,
+    /// The object is read back and must hash like the local file.
+    Sha256,
+}
+
+/// `off`, `size` or `sha256`; `false` and `true` mean `off` and `size`.
+fn de_adopt<'de, D: Deserializer<'de>>(d: D) -> Result<Adopt, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Spec {
+        Flag(bool),
+        Name(String),
+    }
+    match Spec::deserialize(d)? {
+        Spec::Flag(false) => Ok(Adopt::Off),
+        Spec::Flag(true) => Ok(Adopt::Size),
+        Spec::Name(name) => match name.as_str() {
+            "off" => Ok(Adopt::Off),
+            "size" => Ok(Adopt::Size),
+            "sha256" => Ok(Adopt::Sha256),
+            other => Err(de::Error::custom(format!("{other:?} is not off, size or sha256"))),
+        },
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Level {
@@ -742,8 +778,8 @@ pub struct PipelineConfig {
     pub watch: Watch,
     #[serde(default)]
     pub probe_exclusive: bool,
-    #[serde(default = "yes")]
-    pub adopt: bool,
+    #[serde(default, deserialize_with = "de_adopt")]
+    pub adopt: Adopt,
     #[serde(default)]
     pub finalize: FinalizeConfig,
     #[serde(default)]
@@ -1186,6 +1222,16 @@ impl Config {
         if inside(&self.state_dir, &p.root) {
             bail!("{}", at("state_dir must live outside the root"));
         }
+        if p.adopt == Adopt::Size && p.finalize.action != Action::Keep {
+            bail!(
+                "{}",
+                at(&format!(
+                    "adopt: size trusts any object of the right size, so source files cannot be {}d on its \
+                     word; use adopt: sha256 (reads each object back) or off",
+                    p.finalize.action.as_str()
+                ))
+            );
+        }
         let mut hook_keys = BTreeSet::new();
         for hook in &p.registrars {
             let key = hook.key();
@@ -1416,6 +1462,23 @@ mod tests {
         assert_eq!(retry.backoff(1), 30.0);
         assert_eq!(retry.backoff(2), 60.0);
         assert_eq!(retry.backoff(10), 3600.0);
+    }
+
+    #[test]
+    fn adoption_is_off_unless_asked_and_never_by_size_alone_before_a_move() {
+        let adopt = |extra: &str| load(extra).map(|cfg| cfg.pipelines[0].adopt);
+        assert_eq!(adopt("").unwrap(), Adopt::Off);
+        assert_eq!(adopt("    adopt: true\n").unwrap(), Adopt::Size);
+        assert_eq!(adopt("    adopt: false\n").unwrap(), Adopt::Off);
+        assert_eq!(
+            adopt("    adopt: sha256\n    finalize: {action: delete}\n").unwrap(),
+            Adopt::Sha256
+        );
+        let err = adopt("    adopt: size\n    finalize: {action: delete}\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cannot be deleted on its word"), "{err}");
+        assert!(adopt("    adopt: maybe\n").is_err());
     }
 
     #[test]

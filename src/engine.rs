@@ -32,7 +32,7 @@ use serde::Serialize;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::{Action, Fanout, Level, PipelineConfig, Upload, Verify};
+use crate::config::{Action, Adopt, Fanout, Level, PipelineConfig, Upload, Verify};
 use crate::hooks::{Alerts, Notifier, Registrar};
 use crate::journal::{
     Binding, COMPLETE, Candidate, FINALIZED, FileRow, Journal, NewTransfer, OPEN, OutboxRow, REGISTERED, REGISTERING,
@@ -533,8 +533,12 @@ impl Engine {
             .iter()
             .filter(|d| candidate.dests.contains(&d.key))
             .collect();
-        if self.cfg.adopt {
-            for dest in wanted.iter().filter(|d| d.verify == Verify::Size) {
+        if self.cfg.adopt != Adopt::Off {
+            // Size adoption cannot vouch for a hash-verified destination.
+            for dest in wanted
+                .iter()
+                .filter(|d| self.cfg.adopt == Adopt::Sha256 || d.verify == Verify::Size)
+            {
                 if self.db().is_adopted(unit.id, &dest.key)? {
                     continue;
                 }
@@ -780,12 +784,12 @@ impl Engine {
         }
         let prefix = dest.location.key(&unit.key)?;
         let store: Arc<dyn ObjectStore> = dest.location.store.inner.clone();
-        let mut remote: HashMap<String, u64> = HashMap::new();
+        let mut remote: HashMap<String, (u64, Option<String>)> = HashMap::new();
         let mut listing = store.list(Some(&prefix));
         while let Some(meta) = listing.next().await {
             match meta {
                 Ok(meta) => {
-                    remote.insert(meta.location.to_string(), meta.size);
+                    remote.insert(meta.location.to_string(), (meta.size, meta.e_tag));
                 }
                 Err(object_store::Error::NotFound { .. }) => break,
                 Err(e) => return Err(e.into()),
@@ -800,7 +804,10 @@ impl Engine {
             }
             let rel = Layout::remote_rel(&unit.key, &file.within);
             let key = dest.location.key(&rel)?.to_string();
-            if remote.get(&key) != Some(&(file.size as u64)) {
+            let Some((size, etag)) = remote.get(&key) else {
+                continue;
+            };
+            if *size != file.size as u64 {
                 continue;
             }
             let current = self
@@ -811,13 +818,27 @@ impl Engine {
             if current {
                 continue;
             }
+            let verified = if self.cfg.adopt == Adopt::Sha256 {
+                if !self.same_bytes(&file, dest, &rel).await? {
+                    tracing::info!(
+                        pipeline = self.name.as_str(),
+                        unit = unit.key.as_str(),
+                        "{} holds other bytes of the same size; uploading over it",
+                        dest.location.uri_for(&rel)
+                    );
+                    continue;
+                }
+                Verify::Sha256
+            } else {
+                Verify::Size
+            };
             self.db().record_copy(
                 file.id,
                 &dest.key,
                 file.size,
                 file.mtime_ns,
-                None,
-                Verify::Size.as_str(),
+                etag.as_deref(),
+                verified.as_str(),
                 now,
                 &self.all_keys,
             )?;
@@ -850,6 +871,32 @@ impl Engine {
             );
         }
         Ok(())
+    }
+
+    /// Whether the object at `rel` in `dest` reads back with the local file's
+    /// SHA-256 (hashing the file first if the journal has no current hash). A
+    /// file that changes while it is hashed does not match.
+    async fn same_bytes(&self, file: &FileRow, dest: &Destination, rel: &str) -> Result<bool> {
+        let local = match file.current_sha256() {
+            Some(hash) => hash.to_string(),
+            None => {
+                let path = self.src(file);
+                let hashed = tokio::task::spawn_blocking(move || transfer::hash_file(&path)).await??;
+                if !hashed.steady_at((file.size as u64, file.mtime_ns)) {
+                    return Ok(false);
+                }
+                self.db().set_hash(file.id, &hashed.sha256, file.size, file.mtime_ns)?;
+                hashed.sha256
+            }
+        };
+        let target = Target {
+            dest: dest.key.clone(),
+            location: dest.location.clone(),
+            rel: rel.to_string(),
+            verify: Verify::Sha256,
+        };
+        let remote = transfer::readback_sha256(&target).await.map_err(|e| anyhow!(e))?;
+        Ok(remote == local)
     }
 
     // -- registration -------------------------------------------------------
