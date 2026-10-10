@@ -274,6 +274,22 @@ impl Engine {
                     .collect();
                 bail!("pipeline {pipeline}: {}", lines.join(" "));
             }
+            let configured: Vec<String> = parts.registrars.iter().map(|r| r.key.clone()).collect();
+            let orphans = journal.orphaned_outbox(&parts.cfg.name, &configured)?;
+            if !orphans.is_empty() {
+                let pipeline = &parts.cfg.name;
+                let lines: Vec<String> = orphans
+                    .iter()
+                    .map(|(name, count)| {
+                        format!(
+                            "{count} undelivered event(s) wait for registrar {name}, which is no longer \
+                             configured. Configure it again (by that name), or drop them with \
+                             `ferry outbox discard {pipeline} {name}` (with --dry-run first)."
+                        )
+                    })
+                    .collect();
+                bail!("pipeline {pipeline}: {}", lines.join(" "));
+            }
             journal.ensure_copies(&parts.cfg.name, &all_keys)?;
         }
         let started = parts.clock.now();
@@ -1050,13 +1066,17 @@ impl Engine {
                     .map(Recipient::Registrar)
             };
             let Some(recipient) = recipient else {
-                tracing::warn!(
-                    pipeline = self.name.as_str(),
-                    "dropping a {} for {:?}, which is no longer configured",
-                    row.event,
-                    row.registrar
-                );
-                self.db().outbox_done(row.id, self.now())?;
+                // A receipt for a notifier that is gone is only a lost post. A
+                // registrar's event is never acknowledged on its behalf (startup
+                // refuses until an operator discards them).
+                if row.event == EventKind::Receipt.as_str() {
+                    tracing::warn!(
+                        pipeline = self.name.as_str(),
+                        "dropping a receipt for {:?}, which is no longer configured",
+                        row.registrar
+                    );
+                    self.db().outbox_done(row.id, self.now())?;
+                }
                 continue;
             };
             let event: Event = serde_json::from_str(&row.payload).context("outbox payload")?;

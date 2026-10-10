@@ -207,6 +207,43 @@ fn operators_can_complete_abandon_and_retry_units() {
 }
 
 #[test]
+fn events_for_a_renamed_registrar_wait_for_an_operator() {
+    let site = Site::new(
+        "    registrars: [{name: catalog, exec: [ferry-test-no-such-hook]}]\n",
+        "",
+    );
+    write(&site.path("src/u__1/a.tif"), b"alpha");
+    age_tree(&site.path("src"), hour_ago());
+    // The hook cannot start, so the registration stays undelivered.
+    ferry(&site.config).arg("run").assert().failure();
+
+    let renamed = format!(
+        "name: catalogue, exec: ['{}', '--version']",
+        env!("CARGO_BIN_EXE_ferry")
+    );
+    let text = std::fs::read_to_string(&site.config)
+        .unwrap()
+        .replace("name: catalog, exec: [ferry-test-no-such-hook]", &renamed);
+    std::fs::write(&site.config, text).unwrap();
+    ferry(&site.config)
+        .arg("run")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("ferry outbox discard inst catalog"));
+
+    ferry(&site.config)
+        .args(["outbox", "discard", "inst", "catalog", "--dry-run"])
+        .assert()
+        .success()
+        .stdout("[dry run] would drop 1 undelivered event(s) for catalog in inst.\n");
+    ferry(&site.config)
+        .args(["outbox", "discard", "inst", "catalog"])
+        .assert()
+        .success();
+    ferry(&site.config).arg("run").assert().success();
+}
+
+#[test]
 fn a_destination_that_moved_waits_for_an_operator() {
     let site = Site::new("    upload: file\n    unit_idle: 2h\n", "");
     write(&site.path("src/u__1/a.tif"), b"alpha");

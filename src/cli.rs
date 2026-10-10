@@ -87,6 +87,9 @@ enum Command {
     /// Settle a destination whose settings now point somewhere new.
     #[command(subcommand)]
     Destination(DestinationCommand),
+    /// Events waiting for registrars.
+    #[command(subcommand)]
+    Outbox(OutboxCommand),
     /// Check a configuration.
     #[command(subcommand)]
     Config(ConfigCommand),
@@ -110,6 +113,19 @@ enum DestinationCommand {
         pipeline: String,
         destination: String,
         /// Show what would change, changing nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum OutboxCommand {
+    /// Drop a registrar's undelivered events (one renamed or removed from the
+    /// config), so its units stop waiting on it.
+    Discard {
+        pipeline: String,
+        registrar: String,
+        /// Count them, changing nothing.
         #[arg(long)]
         dry_run: bool,
     },
@@ -216,6 +232,20 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
         }
         Command::Schedule { count } => schedule(&load(&config)?, count),
         Command::Destination(command) => destination_command(&load(&config)?, command),
+        Command::Outbox(OutboxCommand::Discard {
+            pipeline,
+            registrar,
+            dry_run,
+        }) => {
+            let journal = open_journal(&load(&config)?)?;
+            let count = journal.discard_outbox(&pipeline, &registrar, !dry_run)?;
+            if dry_run {
+                println!("[dry run] would drop {count} undelivered event(s) for {registrar} in {pipeline}.");
+            } else {
+                println!("Dropped {count} undelivered event(s) for {registrar} in {pipeline}.");
+            }
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Config(ConfigCommand::Validate) => validate(&load(&config)?),
         Command::Service(command) => service_command(&config, command),
     }

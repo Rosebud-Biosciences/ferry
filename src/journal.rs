@@ -1275,6 +1275,44 @@ impl Journal {
         Ok(waiting == 0)
     }
 
+    /// Registrars with undelivered events that are not among `configured`
+    /// (renamed or removed), and how many events wait for each. Receipts for
+    /// notifiers are not counted: losing one costs a chat post, not data.
+    pub fn orphaned_outbox(&self, pipeline: &str, configured: &[String]) -> Result<Vec<(String, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT o.registrar, COUNT(*) FROM outbox o JOIN unit u ON u.id = o.unit_id \
+             WHERE u.pipeline = ? AND o.done_at IS NULL AND o.superseded = 0 AND o.event != 'receipt' \
+             GROUP BY o.registrar ORDER BY o.registrar",
+        )?;
+        let rows = stmt
+            .query_map([pipeline], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows
+            .into_iter()
+            .filter(|(name, _)| !configured.contains(name))
+            .collect())
+    }
+
+    /// Drop a registrar's undelivered events, so units stop waiting on it;
+    /// return how many. With `apply` false, only count them.
+    pub fn discard_outbox(&self, pipeline: &str, registrar: &str, apply: bool) -> Result<i64> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM outbox o JOIN unit u ON u.id = o.unit_id WHERE u.pipeline = ? \
+             AND o.registrar = ? AND o.done_at IS NULL AND o.superseded = 0",
+            params![pipeline, registrar],
+            |r| r.get(0),
+        )?;
+        if apply {
+            self.conn.execute(
+                "UPDATE outbox SET superseded = 1, last_error = 'discarded by an operator' \
+                 WHERE registrar = ? AND done_at IS NULL AND superseded = 0 \
+                 AND unit_id IN (SELECT id FROM unit WHERE pipeline = ?)",
+                params![registrar, pipeline],
+            )?;
+        }
+        Ok(count)
+    }
+
     /// Registered and finalized units whose current generation has had no
     /// receipt queued.
     pub fn unannounced(&self, pipeline: &str) -> Result<Vec<UnitRow>> {
@@ -2037,6 +2075,44 @@ mod tests {
         Journal::open(&path).unwrap().set_meta("schema_version", "99").unwrap();
         let err = Journal::open(&path).err().unwrap().to_string();
         assert!(err.contains("upgrade ferry"), "{err}");
+    }
+
+    #[test]
+    fn events_for_a_registrar_no_longer_configured_wait_until_dropped() {
+        let mut j = Journal::in_memory().unwrap();
+        j.apply_scan("p", &scan(vec![unit("u", &[("a", 1, 1)])], None), 1.0, &dests())
+            .unwrap();
+        let u = j.find_unit("p", "u").unwrap().unwrap();
+        j.set_unit(u.id, None, None, &[("state", Value::from(COMPLETE.to_string()))])
+            .unwrap();
+        let catalog = [("catalog".to_string(), true)];
+        assert!(
+            j.advance(
+                u.id,
+                0,
+                COMPLETE,
+                REGISTERING,
+                None,
+                "register",
+                &catalog,
+                "{}",
+                &[],
+                2.0
+            )
+            .unwrap()
+        );
+
+        assert!(j.orphaned_outbox("p", &["catalog".into()]).unwrap().is_empty());
+        assert_eq!(j.orphaned_outbox("p", &[]).unwrap(), [("catalog".to_string(), 1)]);
+        assert_eq!(j.discard_outbox("p", "catalog", false).unwrap(), 1);
+        assert!(
+            !j.required_done(u.id, 0, "register").unwrap(),
+            "a dry run drops nothing"
+        );
+
+        j.discard_outbox("p", "catalog", true).unwrap();
+        assert!(j.orphaned_outbox("p", &[]).unwrap().is_empty());
+        assert!(j.required_done(u.id, 0, "register").unwrap());
     }
 
     fn binding(identity: &str, verify: &str) -> Binding {
