@@ -28,9 +28,9 @@ Registrar events go through a durable outbox in the journal:
 - **At least once.** An event is retried with exponential backoff
   (`retry.initial`, doubling to `retry.max`) until the hook exits 0, across
   restarts. A crash between the hook succeeding and ferry recording it
-  delivers it again, so a hook must treat a repeated event for the same unit
-  and `generation` as a no-op (an upsert keyed on the unit URI is the usual
-  answer).
+  delivers it again, so a hook must treat a repeated event as a no-op: drop
+  an `id` it has seen, or key its work on the unit and `generation` (an
+  upsert keyed on the unit URI is the usual answer).
 - **In order per unit.** A `finalize` waits behind an undelivered `register`
   for the same unit and registrar.
 - **Stale events are dropped.** A unit that changes after it completed is
@@ -57,11 +57,15 @@ ships, and offered again each round until the registrar takes them.
 ## Events
 
 Every event has the same envelope. Consumers should ignore events and fields
-they do not know: new ones are added without changing `schema`.
+they do not know: new ones are added without changing `schema`. `id` is
+unique to the event, and every delivery of it carries the same one. JSON
+Schemas for events and for the `manifest` registrar's documents are in
+[`schemas/`](../schemas); `ferry schema event` (or `manifest`) prints them.
 
 ```json
 {
   "schema": "ferry.event/v1",
+  "id": "4be0643f1d98573b97cdca98a65347dd",
   "event": "register",
   "agent": "ferry-ingest/0.1.0-alpha.1",
   "node": "workcell1-pc",

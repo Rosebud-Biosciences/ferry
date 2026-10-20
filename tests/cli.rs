@@ -76,6 +76,18 @@ fn version() {
 }
 
 #[test]
+fn schemas_print_without_a_config() {
+    let out = Command::new(env!("CARGO_BIN_EXE_ferry"))
+        .args(["schema", "event"])
+        .env_remove("FERRY_CONFIG")
+        .assert()
+        .success();
+    let schema: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(schema["properties"]["schema"]["const"], "ferry.event/v1");
+    assert!(schema["required"].as_array().unwrap().contains(&"id".into()));
+}
+
+#[test]
 fn validate_shows_where_each_pipeline_sends_data() {
     let site = Site::new("    finalize: {action: delete}\n", "");
     ferry(&site.config)

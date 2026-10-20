@@ -93,6 +93,12 @@ enum Command {
     /// Check a configuration.
     #[command(subcommand)]
     Config(ConfigCommand),
+    /// Print the JSON Schema of the events hooks receive, or of the manifests
+    /// the `manifest` registrar writes.
+    Schema {
+        #[arg(value_enum)]
+        of: SchemaOf,
+    },
     /// Run `ferry watch` as a service that starts at boot.
     #[command(subcommand)]
     Service(ServiceCommand),
@@ -135,6 +141,12 @@ enum OutboxCommand {
 enum ConfigCommand {
     /// Parse and check the config, and show where each pipeline sends data.
     Validate,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum SchemaOf {
+    Event,
+    Manifest,
 }
 
 #[derive(Subcommand)]
@@ -247,6 +259,18 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Command::Config(ConfigCommand::Validate) => validate(&load(&config)?),
+        Command::Schema { of } => {
+            let name = match of {
+                SchemaOf::Event => "event.schema.json",
+                SchemaOf::Manifest => "manifest.schema.json",
+            };
+            let (_, schema) = crate::manifest::schemas()
+                .into_iter()
+                .find(|(file, _)| *file == name)
+                .context("no such schema")?;
+            println!("{}", serde_json::to_string_pretty(&schema)?);
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Service(command) => service_command(&config, command),
     }
 }

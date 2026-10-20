@@ -1,0 +1,204 @@
+{
+  "$defs": {
+    "FileCopy": {
+      "properties": {
+        "destination": {
+          "type": "string"
+        },
+        "etag": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "uploaded_at": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "uri": {
+          "type": "string"
+        },
+        "verified": {
+          "description": "`size` or `sha256` for a verified copy; absent while it is still pending.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "destination",
+        "uri"
+      ],
+      "type": "object"
+    },
+    "ManifestDestination": {
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "required": {
+          "type": "boolean"
+        },
+        "uri": {
+          "type": "string"
+        },
+        "verify": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "uri",
+        "required",
+        "verify"
+      ],
+      "type": "object"
+    },
+    "ManifestFile": {
+      "properties": {
+        "backup_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "copies": {
+          "items": {
+            "$ref": "#/$defs/FileCopy"
+          },
+          "type": "array"
+        },
+        "local_path": {
+          "type": "string"
+        },
+        "mtime": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "path": {
+          "description": "The path within the unit.",
+          "type": "string"
+        },
+        "rel_path": {
+          "description": "The path from the pipeline root.",
+          "type": "string"
+        },
+        "sha256": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "size": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "uri": {
+          "description": "The file on the first destination.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "rel_path",
+        "uri",
+        "size",
+        "mtime",
+        "local_path",
+        "copies"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://raw.githubusercontent.com/Rosebud-Biosciences/ferry/main/schemas/manifest.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "The document the `manifest` registrar writes to the store.",
+  "properties": {
+    "agent": {
+      "type": "string"
+    },
+    "completed": {
+      "format": "date-time",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "created": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "destinations": {
+      "items": {
+        "$ref": "#/$defs/ManifestDestination"
+      },
+      "type": "array"
+    },
+    "files": {
+      "items": {
+        "$ref": "#/$defs/ManifestFile"
+      },
+      "type": "array"
+    },
+    "finalize": {
+      "description": "`keep`, `move` or `delete`: what happens to the source files.",
+      "type": "string"
+    },
+    "first_seen": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "generation": {
+      "description": "Bumped each time the unit completes again after a change.",
+      "format": "int64",
+      "type": "integer"
+    },
+    "local_path": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "node": {
+      "type": "string"
+    },
+    "pipeline": {
+      "type": "string"
+    },
+    "root": {
+      "type": "string"
+    },
+    "schema": {
+      "const": "ferry.manifest/v1",
+      "type": "string"
+    },
+    "unit": {
+      "type": "string"
+    },
+    "uri": {
+      "description": "The unit on the first destination (the primary).",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema",
+    "agent",
+    "node",
+    "pipeline",
+    "unit",
+    "generation",
+    "uri",
+    "root",
+    "first_seen",
+    "created",
+    "finalize",
+    "destinations",
+    "files"
+  ],
+  "title": "ferry manifest",
+  "type": "object"
+}

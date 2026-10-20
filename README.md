@@ -242,12 +242,36 @@ JSON); `exec:` runs a command with the event on stdin.
   (`--system` for a system unit). `ferry service print` shows the definition
   without installing it.
 
+## Compatibility
+
+Until 1.0, a minor release (`0.x`) may break any of the following, and the
+[changelog](CHANGELOG.md) says how; from 1.0, only a major release does. What
+releases keep stable:
+
+- The command line: commands, flags and exit codes (0 success; 1 a pass with
+  failures, which are retried, or an operator command that could not act; 2
+  an error, such as a config that does not load).
+- The config format, version 1 (`version: 1`, optional). A config written
+  for a newer format is refused, never misread.
+- What hooks receive: events (`ferry.event/v1`) and manifests
+  (`ferry.manifest/v1`), with JSON Schemas in [`schemas/`](schemas). Fields
+  and event kinds are added without changing `schema`; a change that would
+  break a consumer that ignores what it does not know changes it.
+- The journal: a newer ferry upgrades it in place the first time it opens
+  it, and an older ferry refuses a journal a newer one upgraded.
+
+The Rust library is ferry's internals, not an API, and is not published to
+crates.io.
+
 ## Development
 
 ```bash
 cargo fmt --check && cargo clippy --all-targets -- -D warnings
 cargo test
 ```
+
+`FERRY_BLESS=1 cargo test --lib schemas` regenerates `schemas/` after a change
+to what hooks receive.
 
 The S3 tests run when `FERRY_TEST_S3_ENDPOINT` (plus `FERRY_TEST_S3_KEY`,
 `FERRY_TEST_S3_SECRET` and an existing `FERRY_TEST_S3_BUCKET`) points at an S3

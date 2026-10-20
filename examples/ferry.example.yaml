@@ -2,6 +2,7 @@
 # this file's directory; ${VAR} and ${VAR:-default} are read from the
 # environment (quote them inside {...} flow mappings).
 
+version: 1                        # the config format; optional
 node: workcell1-pc                # default: the hostname
 state_dir: C:/ProgramData/ferry   # journal, logs and lock live here
 

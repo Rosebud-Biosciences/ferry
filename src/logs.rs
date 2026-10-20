@@ -22,7 +22,7 @@ use tracing_subscriber::{EnvFilter, Layer, fmt};
 
 use crate::hooks::ExecHook;
 use crate::journal::Journal;
-use crate::manifest::{Event, EventKind, ShippedLog};
+use crate::manifest::{Event, EventKind, ShippedLog, log_event_id};
 use crate::stores::Location;
 use crate::util::{iso, now_secs};
 
@@ -164,15 +164,17 @@ pub async fn ship_logs(
             .and_then(|n| n.strip_suffix(".jsonl"))
             .unwrap_or_default()
             .to_string();
-        let mut event = Event::new(EventKind::Log, node, None);
-        event.log = Some(ShippedLog {
+        let log = ShippedLog {
             node: node.to_string(),
             name: row.name.clone(),
             day,
             uri: row.uri,
             size: row.size,
             sha256: row.sha256,
-        });
+        };
+        let mut event = Event::new(EventKind::Log, node, None);
+        event.id = log_event_id(&log);
+        event.log = Some(log);
         let result = hook.run(&event).await;
         if let Ok(j) = journal.lock() {
             let recorded = match &result {

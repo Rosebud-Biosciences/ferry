@@ -43,7 +43,7 @@ pub const PENDING: &str = "pending";
 pub const UPLOADED: &str = "uploaded";
 pub const DONE: &str = "done";
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS unit (
@@ -498,6 +498,14 @@ fn migrate(conn: &Connection, from: i64) -> Result<()> {
     // 4 adds the `destination` table; the first run after the upgrade records
     // where each destination points. 5 adds `log_delivery`: logs shipped
     // before it were told about once, as before, and are not told again.
+    if from < 6 {
+        // Events carry an `id` from 6 on, and every delivery of an event
+        // repeats its payload, so queued ones are given theirs now.
+        tx.execute_batch(
+            "UPDATE outbox SET payload = json_set(payload, '$.id', lower(hex(randomblob(16)))) \
+             WHERE json_extract(payload, '$.id') IS NULL;",
+        )?;
+    }
     tx.execute(
         "UPDATE meta SET value = ? WHERE key = 'schema_version'",
         [SCHEMA_VERSION.to_string()],
@@ -2442,5 +2450,37 @@ mod tests {
             (Some(3), Some(1), None)
         );
         assert!(j.unannounced("p").unwrap().is_empty());
+    }
+
+    #[test]
+    fn upgrading_gives_queued_events_ids_of_their_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.sqlite3");
+        Journal::open(&path)
+            .unwrap()
+            .conn
+            .execute_batch(
+                "INSERT INTO unit (id, pipeline, key, first_seen, last_change) VALUES (1, 'p', 'u', 1, 1);
+                 INSERT INTO outbox (unit_id, generation, registrar, event, required, payload, created_at) VALUES \
+                 (1, 1, 'catalog', 'register', 1, '{\"schema\":\"ferry.event/v1\",\"event\":\"register\"}', 1), \
+                 (1, 1, 'notifier:chat', 'receipt', 0, '{\"schema\":\"ferry.event/v1\",\"event\":\"receipt\"}', 1);
+                 UPDATE meta SET value = '5' WHERE key = 'schema_version';",
+            )
+            .unwrap();
+
+        let j = Journal::open(&path).unwrap();
+        let ids: Vec<String> = j
+            .outbox_for_unit(1)
+            .unwrap()
+            .iter()
+            .map(|row| {
+                serde_json::from_str::<serde_json::Value>(&row.payload).unwrap()["id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.iter().all(|id| id.len() == 32) && ids[0] != ids[1], "{ids:?}");
     }
 }

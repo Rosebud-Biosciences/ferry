@@ -297,7 +297,7 @@ fn de_adopt<'de, D: Deserializer<'de>>(d: D) -> Result<Adopt, D::Error> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Level {
     Info,
@@ -838,9 +838,15 @@ impl Default for LogsConfig {
     }
 }
 
+/// The config format this ferry reads (`version:`).
+pub const CONFIG_VERSION: u32 = 1;
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    /// The config format; a config newer than this ferry reads is refused.
+    #[serde(default)]
+    pub version: Option<u32>,
     #[serde(default = "default_node")]
     pub node: String,
     pub state_dir: PathBuf,
@@ -1067,6 +1073,11 @@ impl Config {
 
     pub fn validate(&self) -> Result<()> {
         let name_re = Regex::new(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$").expect("valid regex");
+        if let Some(version) = self.version
+            && version != CONFIG_VERSION
+        {
+            bail!("version: this ferry reads version {CONFIG_VERSION} configs, not {version}");
+        }
         if self.pipelines.is_empty() {
             bail!("pipelines: at least one pipeline is required");
         }
@@ -1424,6 +1435,15 @@ mod tests {
         assert!(err.contains("exactly one of `exec` or `manifest`"), "{err}");
         let err = load("    registrars: [nope]\n").unwrap_err().to_string();
         assert!(err.contains("unknown registrar"), "{err}");
+    }
+
+    #[test]
+    fn a_config_says_which_format_it_is() {
+        let top = |extra: &str| Config::from_yaml(&format!("{extra}{}", yaml("[s3]", "")), &base());
+        assert_eq!(top("version: 1\n").unwrap().version, Some(1));
+        assert_eq!(top("").unwrap().version, None);
+        let err = top("version: 2\n").unwrap_err().to_string();
+        assert!(err.contains("reads version 1 configs, not 2"), "{err}");
     }
 
     #[test]
