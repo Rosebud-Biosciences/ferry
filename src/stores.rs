@@ -31,11 +31,41 @@ impl std::fmt::Debug for Store {
     }
 }
 
-/// A relative path as an object key: forward slashes, no empty or dot parts.
-pub fn normalize_key(rel: &str) -> Result<String> {
-    let parts: Vec<&str> = rel.split(['/', '\\']).filter(|p| !p.is_empty() && *p != ".").collect();
+/// A configured prefix as key parts: either slash separates, and empty or
+/// dot parts drop out.
+pub fn normalize_prefix(prefix: &str) -> Result<String> {
+    let parts: Vec<&str> = prefix
+        .split(['/', '\\'])
+        .filter(|p| !p.is_empty() && *p != ".")
+        .collect();
     if parts.contains(&"..") {
-        bail!("key escapes its prefix: {rel:?}");
+        bail!("prefix escapes its store: {prefix:?}");
+    }
+    Ok(parts.join("/"))
+}
+
+/// A `/`-separated path of file and directory names as an object key. Names
+/// can hold anything but `/`, so each is percent-encoded where a key cannot
+/// hold it faithfully -- `%`, `\` and control characters -- which keeps
+/// distinct names distinct (`a\b` is not `a/b`) and decodes back exactly.
+pub fn encode_rel(rel: &str) -> Result<String> {
+    let mut parts = Vec::new();
+    for part in rel.split('/').filter(|p| !p.is_empty()) {
+        if part == "." || part == ".." {
+            bail!("key escapes its prefix: {rel:?}");
+        }
+        let mut encoded = String::with_capacity(part.len());
+        for c in part.chars() {
+            if c == '%' || c == '\\' || c.is_control() {
+                let mut buf = [0u8; 4];
+                for byte in c.encode_utf8(&mut buf).bytes() {
+                    encoded.push_str(&format!("%{byte:02X}"));
+                }
+            } else {
+                encoded.push(c);
+            }
+        }
+        parts.push(encoded);
     }
     Ok(parts.join("/"))
 }
@@ -64,8 +94,9 @@ impl Location {
         }
     }
 
-    pub fn child(&self, rel: &str) -> Result<Self> {
-        let rel = normalize_key(rel)?;
+    /// The location under a configured prefix.
+    pub fn child(&self, prefix: &str) -> Result<Self> {
+        let rel = normalize_prefix(prefix)?;
         Ok(Self {
             store: self.store.clone(),
             base: join(&self.base, &rel),
@@ -77,13 +108,14 @@ impl Location {
         })
     }
 
+    /// The key of `rel`, a path of names under this location ([`encode_rel`]).
     pub fn key(&self, rel: &str) -> Result<KeyPath> {
-        let full = join(&self.base, &normalize_key(rel)?);
+        let full = join(&self.base, &encode_rel(rel)?);
         KeyPath::parse(&full).map_err(|e| anyhow!("{full:?} is not a valid object key: {e}"))
     }
 
     pub fn uri_for(&self, rel: &str) -> String {
-        match normalize_key(rel) {
+        match encode_rel(rel) {
             Ok(rel) if !rel.is_empty() => format!("{}/{rel}", self.uri),
             _ => self.uri.clone(),
         }
@@ -130,7 +162,7 @@ pub fn open_store(name: &str, cfg: &StoreConfig) -> Result<Arc<Store>> {
             builder = builder.with_config(key, value);
         }
         let store = builder.build().with_context(|| format!("store {name}"))?;
-        let base = normalize_key(prefix)?;
+        let base = normalize_prefix(prefix)?;
         let uri = if base.is_empty() {
             format!("s3://{bucket}")
         } else {
@@ -230,9 +262,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn keys_are_normalized_and_cannot_escape() {
-        assert_eq!(normalize_key("/a//b\\c/./d/").unwrap(), "a/b/c/d");
-        assert!(normalize_key("a/../b").is_err());
+    fn prefixes_are_normalized_and_cannot_escape() {
+        assert_eq!(normalize_prefix("/a//b\\c/./d/").unwrap(), "a/b/c/d");
+        assert!(normalize_prefix("a/../b").is_err());
+    }
+
+    #[test]
+    fn names_encode_reversibly_into_keys() {
+        assert_eq!(encode_rel("u/a b.tif").unwrap(), "u/a b.tif");
+        // A backslash is part of a name, not a separator.
+        assert_eq!(encode_rel("u/a\\b.tif").unwrap(), "u/a%5Cb.tif");
+        assert_ne!(encode_rel("u/a\\b.tif").unwrap(), encode_rel("u/a/b.tif").unwrap());
+        assert_eq!(encode_rel("u/100%.tif").unwrap(), "u/100%25.tif");
+        assert_eq!(encode_rel("u/a%5Cb.tif").unwrap(), "u/a%255Cb.tif");
+        assert_eq!(encode_rel("u/line\nbreak").unwrap(), "u/line%0Abreak");
+        assert_eq!(encode_rel("u/plaque_é.tif").unwrap(), "u/plaque_é.tif");
+        assert!(encode_rel("u/../x").is_err());
+        assert!(encode_rel("./x").is_err());
     }
 
     #[test]

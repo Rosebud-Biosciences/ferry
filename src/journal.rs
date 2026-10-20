@@ -14,6 +14,9 @@
 //! then `finalized` once the source copy is kept, moved or deleted. Because a
 //! copy only counts while its stats match, a file that changes is pending again
 //! for every destination without any bookkeeping beyond the new stats.
+//!
+//! `receipt_gen` is the last generation of a unit whose receipt was queued for
+//! the notifiers, so each generation is announced once.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -40,7 +43,7 @@ pub const PENDING: &str = "pending";
 pub const UPLOADED: &str = "uploaded";
 pub const DONE: &str = "done";
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 5;
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS unit (
@@ -62,9 +65,13 @@ CREATE TABLE IF NOT EXISTS unit (
     last_error TEXT,
     alerted INTEGER NOT NULL DEFAULT 0,
     note TEXT,
+    receipt_gen INTEGER,
+    scan_error TEXT,
     UNIQUE (pipeline, key)
 );
 CREATE INDEX IF NOT EXISTS unit_by_state ON unit (pipeline, state);
+CREATE INDEX IF NOT EXISTS unit_unannounced ON unit (pipeline)
+    WHERE state IN ('registered', 'finalized') AND (receipt_gen IS NULL OR receipt_gen < generation);
 CREATE TABLE IF NOT EXISTS file (
     id INTEGER PRIMARY KEY,
     unit_id INTEGER NOT NULL REFERENCES unit (id) ON DELETE CASCADE,
@@ -95,6 +102,13 @@ CREATE TABLE IF NOT EXISTS copy (
     last_error TEXT,
     alerted INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (file_id, dest)
+);
+CREATE TABLE IF NOT EXISTS destination (
+    pipeline TEXT NOT NULL,
+    name TEXT NOT NULL,
+    identity TEXT NOT NULL,
+    verify TEXT NOT NULL,
+    PRIMARY KEY (pipeline, name)
 );
 CREATE TABLE IF NOT EXISTS adoption (
     unit_id INTEGER NOT NULL REFERENCES unit (id) ON DELETE CASCADE,
@@ -142,6 +156,14 @@ CREATE TABLE IF NOT EXISTS shipped_log (
     sha256 TEXT NOT NULL,
     shipped_at REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS log_delivery (
+    name TEXT NOT NULL REFERENCES shipped_log (name) ON DELETE CASCADE,
+    hook TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    done_at REAL,
+    PRIMARY KEY (name, hook)
+);
 "#;
 
 /// `NOT (current copy)`, for a copy `c` of a file `f`.
@@ -167,6 +189,10 @@ pub struct UnitRow {
     pub last_error: Option<String>,
     pub alerted: bool,
     pub note: Option<String>,
+    pub receipt_gen: Option<i64>,
+    /// Why the last scan could not read all of the unit; it neither
+    /// completes, registers nor finalizes until a scan can.
+    pub scan_error: Option<String>,
 }
 
 impl UnitRow {
@@ -190,6 +216,8 @@ impl UnitRow {
             last_error: r.get("last_error")?,
             alerted: r.get("alerted")?,
             note: r.get("note")?,
+            receipt_gen: r.get("receipt_gen")?,
+            scan_error: r.get("scan_error")?,
         })
     }
 }
@@ -380,6 +408,35 @@ pub struct ScanChanges {
     pub gone_files: Vec<String>,
     pub reopened: Vec<(String, String)>,
     pub gone_units: Vec<String>,
+    /// Units the scan newly could not read in full, and why.
+    pub unreadable: Vec<(String, String)>,
+}
+
+/// Where a destination points, and how it verifies copies.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Binding {
+    pub name: String,
+    pub identity: String,
+    pub verify: String,
+}
+
+/// A destination that now points somewhere other than where its copies are.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Moved {
+    pub name: String,
+    pub was: String,
+    pub now: String,
+}
+
+/// What `ferry destination reset` changes.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ResetPlan {
+    /// Files whose copy there is forgotten, to go up again.
+    pub files: i64,
+    /// Units already registered or complete, which register again.
+    pub reopened: Vec<String>,
+    /// Copies of finalized files, kept as a record: their sources are gone.
+    pub kept: i64,
 }
 
 /// A file ready to upload, and the destinations that still need it.
@@ -424,6 +481,43 @@ const UNIT_COLUMNS: &[&str] = &[
     "note",
 ];
 
+/// Bring a journal at schema `from` up to [`SCHEMA_VERSION`], in one
+/// transaction. Runs before [`SCHEMA`], whose indexes may need new columns.
+fn migrate(conn: &Connection, from: i64) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    if from < 2 {
+        // Which generation of each unit had its receipt queued. Units already
+        // registered or finalized count as announced, so an upgrade never
+        // sends receipts for them.
+        add_column(&tx, "unit", "receipt_gen", "INTEGER")?;
+        tx.execute_batch("UPDATE unit SET receipt_gen = generation WHERE state IN ('registered', 'finalized');")?;
+    }
+    if from < 3 {
+        add_column(&tx, "unit", "scan_error", "TEXT")?;
+    }
+    // 4 adds the `destination` table; the first run after the upgrade records
+    // where each destination points. 5 adds `log_delivery`: logs shipped
+    // before it were told about once, as before, and are not told again.
+    tx.execute(
+        "UPDATE meta SET value = ? WHERE key = 'schema_version'",
+        [SCHEMA_VERSION.to_string()],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn add_column(conn: &Connection, table: &str, column: &str, declaration: &str) -> Result<()> {
+    let present: i64 = conn.query_row(
+        &format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = ?"),
+        [column],
+        |r| r.get(0),
+    )?;
+    if present == 0 {
+        conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {declaration};"))?;
+    }
+    Ok(())
+}
+
 pub struct Journal {
     conn: Connection,
 }
@@ -461,22 +555,25 @@ impl Journal {
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.busy_timeout(std::time::Duration::from_secs(30))?;
-        conn.execute_batch(SCHEMA)?;
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);")?;
         let found: Option<String> = conn
             .query_row("SELECT value FROM meta WHERE key = 'schema_version'", [], |r| r.get(0))
             .optional()?;
-        match found {
-            None => {
-                conn.execute(
-                    "INSERT INTO meta (key, value) VALUES ('schema_version', ?)",
-                    [SCHEMA_VERSION.to_string()],
-                )?;
+        if let Some(v) = &found {
+            match v.parse::<i64>().unwrap_or(i64::MAX) {
+                newer if newer > SCHEMA_VERSION => {
+                    bail!("the journal has schema {v}; this ferry understands {SCHEMA_VERSION} -- upgrade ferry");
+                }
+                older if older < SCHEMA_VERSION => migrate(&conn, older)?,
+                _ => {}
             }
-            Some(v) if v.parse::<i64>().unwrap_or(i64::MAX) > SCHEMA_VERSION => {
-                bail!("the journal has schema {v}; this ferry understands {SCHEMA_VERSION} -- upgrade ferry");
-            }
-            Some(_) => {}
         }
+        conn.execute_batch(SCHEMA)?;
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('schema_version', ?) \
+             ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+            [SCHEMA_VERSION.to_string()],
+        )?;
         Ok(Self { conn })
     }
 
@@ -571,6 +668,131 @@ impl Journal {
 
     /// Give every file of every unfinished unit a copy row per destination, so a
     /// destination added to the config picks up what is not yet finalized.
+    /// Check each destination against what the journal recorded: the first
+    /// time, record it. A stronger `verify` than recorded sends the copies it
+    /// did not cover again; a destination that now points elsewhere is
+    /// returned, and left for an operator to accept or reset.
+    pub fn bind_destinations(&mut self, pipeline: &str, bindings: &[Binding], dests: &[String]) -> Result<Vec<Moved>> {
+        let tx = self.conn.transaction()?;
+        let mut moved = Vec::new();
+        for b in bindings {
+            let known: Option<(String, String)> = tx
+                .query_row(
+                    "SELECT identity, verify FROM destination WHERE pipeline = ? AND name = ?",
+                    params![pipeline, b.name],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            match known {
+                None => {
+                    tx.execute(
+                        "INSERT INTO destination (pipeline, name, identity, verify) VALUES (?, ?, ?, ?)",
+                        params![pipeline, b.name, b.identity, b.verify],
+                    )?;
+                }
+                Some((identity, _)) if identity != b.identity => moved.push(Moved {
+                    name: b.name.clone(),
+                    was: identity,
+                    now: b.identity.clone(),
+                }),
+                Some((_, verify)) if verify != b.verify => {
+                    if b.verify == "sha256" {
+                        let weaker = live_copies(
+                            &tx,
+                            pipeline,
+                            &b.name,
+                            "AND (c.verified IS NULL OR c.verified != 'sha256')",
+                        )?;
+                        forget_copies(&tx, &weaker, &b.name, dests)?;
+                    }
+                    tx.execute(
+                        "UPDATE destination SET verify = ? WHERE pipeline = ? AND name = ?",
+                        params![b.verify, pipeline, b.name],
+                    )?;
+                }
+                Some(_) => {}
+            }
+        }
+        tx.commit()?;
+        Ok(moved)
+    }
+
+    /// The identity the journal recorded for a destination, if any.
+    pub fn destination(&self, pipeline: &str, name: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT identity FROM destination WHERE pipeline = ? AND name = ?",
+                params![pipeline, name],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// The destination's new settings reach the same objects: record them and
+    /// keep its copies.
+    pub fn accept_destination(&mut self, pipeline: &str, binding: &Binding) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO destination (pipeline, name, identity, verify) VALUES (?, ?, ?, ?) \
+             ON CONFLICT (pipeline, name) DO UPDATE SET identity = excluded.identity, verify = excluded.verify",
+            params![pipeline, binding.name, binding.identity, binding.verify],
+        )?;
+        Ok(())
+    }
+
+    /// Forget a destination's copies of every file not yet finalized, so they
+    /// go up again; units already complete or registered reopen to register
+    /// with the new copies. With `apply` false, only report what would change.
+    pub fn reset_destination(
+        &mut self,
+        pipeline: &str,
+        binding: &Binding,
+        dests: &[String],
+        apply: bool,
+    ) -> Result<ResetPlan> {
+        let tx = self.conn.transaction()?;
+        let files = live_copies(&tx, pipeline, &binding.name, "")?;
+        let mut plan = ResetPlan {
+            files: files.len() as i64,
+            ..Default::default()
+        };
+        let units: Vec<(i64, String)> = {
+            let mut stmt = tx.prepare(
+                "SELECT DISTINCT u.id, u.key FROM unit u JOIN file f ON f.unit_id = u.id \
+                 JOIN copy c ON c.file_id = f.id WHERE u.pipeline = ? AND c.dest = ? AND c.state = 'done' \
+                 AND f.state IN ('pending', 'uploaded') AND u.state IN ('complete', 'registering', 'registered') \
+                 ORDER BY u.key",
+            )?;
+            stmt.query_map(params![pipeline, binding.name], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        plan.reopened = units.iter().map(|(_, key)| key.clone()).collect();
+        plan.kept = tx.query_row(
+            "SELECT COUNT(*) FROM copy c JOIN file f ON f.id = c.file_id JOIN unit u ON u.id = f.unit_id \
+             WHERE u.pipeline = ? AND c.dest = ? AND c.state = 'done' \
+             AND (f.state = 'finalized' OR u.state = 'finalized')",
+            params![pipeline, binding.name],
+            |r| r.get(0),
+        )?;
+        if apply {
+            forget_copies(&tx, &files, &binding.name, dests)?;
+            for (unit_id, _) in &units {
+                reopen(&tx, *unit_id, &format!("destination {} was reset", binding.name))?;
+            }
+            tx.execute(
+                "DELETE FROM adoption WHERE dest = ? AND unit_id IN (SELECT id FROM unit WHERE pipeline = ?)",
+                params![binding.name, pipeline],
+            )?;
+            tx.execute(
+                "INSERT INTO destination (pipeline, name, identity, verify) VALUES (?, ?, ?, ?) \
+                 ON CONFLICT (pipeline, name) DO UPDATE SET identity = excluded.identity, verify = excluded.verify",
+                params![pipeline, binding.name, binding.identity, binding.verify],
+            )?;
+            tx.commit()?;
+        }
+        Ok(plan)
+    }
+
     pub fn ensure_copies(&mut self, pipeline: &str, dests: &[String]) -> Result<()> {
         let tx = self.conn.transaction()?;
         for dest in dests {
@@ -608,19 +830,42 @@ impl Journal {
                 .map(|r| r.map(|u| (u.key.clone(), u)))
                 .collect::<rusqlite::Result<_>>()?
         };
+        // An unattributed error could hide any unit's files.
+        let everywhere = scan.unattributed.then(|| summarize(&scan.errors));
         for (key, obs) in &scan.units {
-            observe_unit(&tx, pipeline, known.get(key), obs, now, dests, &mut changes)?;
+            let error = everywhere
+                .clone()
+                .or_else(|| (!obs.errors.is_empty()).then(|| summarize(&obs.errors)));
+            observe_unit(
+                &tx,
+                pipeline,
+                known.get(key),
+                obs,
+                error.as_deref(),
+                now,
+                dests,
+                &mut changes,
+            )?;
         }
-        let unseen: Vec<&UnitRow> = match &scan.scope {
-            None => known.values().filter(|u| !scan.units.contains_key(&u.key)).collect(),
-            Some(scope) => scope
-                .iter()
-                .filter(|k| !scan.units.contains_key(*k))
-                .filter_map(|k| known.get(k))
-                .collect(),
-        };
-        for unit in unseen {
-            unit_missing(&tx, unit, &mut changes)?;
+        if let Some(why) = &everywhere {
+            for unit in known.values().filter(|u| !scan.units.contains_key(&u.key)) {
+                if ACTIVE.contains(&unit.state.as_str()) {
+                    mark_unreadable(&tx, unit, why, &mut changes)?;
+                }
+            }
+        } else if scan.errors.is_empty() {
+            // Only a complete look can tell that a unit is gone.
+            let unseen: Vec<&UnitRow> = match &scan.scope {
+                None => known.values().filter(|u| !scan.units.contains_key(&u.key)).collect(),
+                Some(scope) => scope
+                    .iter()
+                    .filter(|k| !scan.units.contains_key(*k))
+                    .filter_map(|k| known.get(k))
+                    .collect(),
+            };
+            for unit in unseen {
+                unit_missing(&tx, unit, &mut changes)?;
+            }
         }
         tx.commit()?;
         Ok(changes)
@@ -839,11 +1084,43 @@ impl Journal {
         Ok(())
     }
 
-    pub fn finalize_file(&self, file_id: i64, present: bool, backup_path: Option<&str>) -> Result<()> {
-        self.conn.execute(
-            "UPDATE file SET state = 'finalized', present = ?, backup_path = COALESCE(?, backup_path) WHERE id = ?",
-            params![present, backup_path, file_id],
+    /// Record a file's source kept, moved or deleted -- only while the row
+    /// still describes the bytes that were (`size`, `mtime_ns`, uploaded).
+    /// `false` if a scan changed it meanwhile: it then tracks new bytes.
+    pub fn finalize_file(
+        &self,
+        file_id: i64,
+        size: i64,
+        mtime_ns: i64,
+        present: bool,
+        backup_path: Option<&str>,
+    ) -> Result<bool> {
+        Ok(self.conn.execute(
+            "UPDATE file SET state = 'finalized', present = ?, backup_path = COALESCE(?, backup_path) \
+             WHERE id = ? AND state = 'uploaded' AND size = ? AND mtime_ns = ?",
+            params![present, backup_path, file_id, size, mtime_ns],
+        )? == 1)
+    }
+
+    /// A copy is gone from its destination (or no longer what was verified):
+    /// forget it, so the file goes up again, and reopen the unit, so it is
+    /// registered with the new copy.
+    pub fn copy_lost(&mut self, file_id: i64, dest: &str, why: &str, dests: &[String]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        forget_copies(&tx, &[file_id], dest, dests)?;
+        tx.execute(
+            "UPDATE copy SET last_error = ? WHERE file_id = ? AND dest = ?",
+            params![why, file_id, dest],
         )?;
+        let (unit_id, state): (i64, String) = tx.query_row(
+            "SELECT u.id, u.state FROM unit u JOIN file f ON f.unit_id = u.id WHERE f.id = ?",
+            [file_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if state != OPEN {
+            reopen(&tx, unit_id, why)?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -1039,6 +1316,86 @@ impl Journal {
         Ok(waiting == 0)
     }
 
+    /// Registrars with undelivered events that are not among `configured`
+    /// (renamed or removed), and how many events wait for each. Receipts for
+    /// notifiers are not counted: losing one costs a chat post, not data.
+    pub fn orphaned_outbox(&self, pipeline: &str, configured: &[String]) -> Result<Vec<(String, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT o.registrar, COUNT(*) FROM outbox o JOIN unit u ON u.id = o.unit_id \
+             WHERE u.pipeline = ? AND o.done_at IS NULL AND o.superseded = 0 AND o.event != 'receipt' \
+             GROUP BY o.registrar ORDER BY o.registrar",
+        )?;
+        let rows = stmt
+            .query_map([pipeline], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows
+            .into_iter()
+            .filter(|(name, _)| !configured.contains(name))
+            .collect())
+    }
+
+    /// Drop a registrar's undelivered events, so units stop waiting on it;
+    /// return how many. With `apply` false, only count them.
+    pub fn discard_outbox(&self, pipeline: &str, registrar: &str, apply: bool) -> Result<i64> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM outbox o JOIN unit u ON u.id = o.unit_id WHERE u.pipeline = ? \
+             AND o.registrar = ? AND o.done_at IS NULL AND o.superseded = 0",
+            params![pipeline, registrar],
+            |r| r.get(0),
+        )?;
+        if apply {
+            self.conn.execute(
+                "UPDATE outbox SET superseded = 1, last_error = 'discarded by an operator' \
+                 WHERE registrar = ? AND done_at IS NULL AND superseded = 0 \
+                 AND unit_id IN (SELECT id FROM unit WHERE pipeline = ?)",
+                params![registrar, pipeline],
+            )?;
+        }
+        Ok(count)
+    }
+
+    /// Registered and finalized units whose current generation has had no
+    /// receipt queued.
+    pub fn unannounced(&self, pipeline: &str) -> Result<Vec<UnitRow>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT * FROM unit WHERE pipeline = ? AND state IN ('registered', 'finalized') \
+             AND (receipt_gen IS NULL OR receipt_gen < generation) ORDER BY first_seen, id",
+        )?;
+        let rows = stmt.query_map([pipeline], UnitRow::from_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Mark `generation` of a unit announced and queue its receipt for each of
+    /// `notifiers`, in one transaction. `false` (and nothing queued) if that
+    /// generation was announced already, or the unit moved on.
+    pub fn announce(
+        &mut self,
+        unit_id: i64,
+        generation: i64,
+        notifiers: &[String],
+        payload: &str,
+        now: f64,
+    ) -> Result<bool> {
+        let tx = self.conn.transaction()?;
+        let marked = tx.execute(
+            "UPDATE unit SET receipt_gen = ?2 WHERE id = ?1 AND generation = ?2 \
+             AND state IN ('registered', 'finalized') AND (receipt_gen IS NULL OR receipt_gen < ?2)",
+            params![unit_id, generation],
+        )?;
+        if marked != 1 {
+            return Ok(false);
+        }
+        for notifier in notifiers {
+            tx.execute(
+                "INSERT INTO outbox (unit_id, generation, registrar, event, required, payload, created_at) \
+                 VALUES (?, ?, ?, 'receipt', 0, ?, ?)",
+                params![unit_id, generation, notifier, payload, now],
+            )?;
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
     // -- operator actions ---------------------------------------------------
     pub fn force_complete(&self, pipeline: &str, key: &str) -> Result<Option<UnitRow>> {
         let unit = self.find_unit(pipeline, key)?;
@@ -1204,16 +1561,110 @@ impl Journal {
             .is_some())
     }
 
-    pub fn record_shipped(&self, name: &str, uri: &str, size: i64, sha256: &str, now: f64) -> Result<()> {
-        self.conn.execute(
+    /// Record a log shipped, and that each of `hooks` is yet to be told.
+    pub fn record_shipped(
+        &mut self,
+        name: &str,
+        uri: &str,
+        size: i64,
+        sha256: &str,
+        now: f64,
+        hooks: &[String],
+    ) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
             "INSERT OR REPLACE INTO shipped_log (name, uri, size, sha256, shipped_at) VALUES (?, ?, ?, ?, ?)",
             params![name, uri, size, sha256, now],
+        )?;
+        for hook in hooks {
+            tx.execute(
+                "INSERT OR IGNORE INTO log_delivery (name, hook) VALUES (?, ?)",
+                params![name, hook],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Shipped logs that one of `hooks` has not taken yet, oldest first.
+    pub fn undelivered_logs(&self, hooks: &[String]) -> Result<Vec<(ShippedRow, String)>> {
+        if hooks.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sql = format!(
+            "SELECT s.name, s.uri, s.size, s.sha256, d.hook FROM log_delivery d \
+             JOIN shipped_log s ON s.name = d.name WHERE d.done_at IS NULL AND d.hook IN ({}) \
+             ORDER BY s.name, d.hook",
+            marks(hooks.len())
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(values(hooks)), |r| {
+            Ok((
+                ShippedRow {
+                    name: r.get(0)?,
+                    uri: r.get(1)?,
+                    size: r.get(2)?,
+                    sha256: r.get(3)?,
+                },
+                r.get(4)?,
+            ))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn log_delivered(&self, name: &str, hook: &str, now: f64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE log_delivery SET done_at = ?, last_error = NULL WHERE name = ? AND hook = ?",
+            params![now, name, hook],
+        )?;
+        Ok(())
+    }
+
+    pub fn log_delivery_failed(&self, name: &str, hook: &str, error: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE log_delivery SET attempts = attempts + 1, last_error = ? WHERE name = ? AND hook = ?",
+            params![error, name, hook],
         )?;
         Ok(())
     }
 }
 
+/// A shipped log, as the journal recorded it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShippedRow {
+    pub name: String,
+    pub uri: String,
+    pub size: i64,
+    pub sha256: String,
+}
+
 // -- scan helpers (inside a transaction) -------------------------------------
+
+/// Files not yet finalized with a made copy at `dest` (`extra`: more
+/// conditions on that copy, `c`).
+fn live_copies(conn: &Connection, pipeline: &str, dest: &str, extra: &str) -> rusqlite::Result<Vec<i64>> {
+    let sql = format!(
+        "SELECT f.id FROM file f JOIN unit u ON u.id = f.unit_id JOIN copy c ON c.file_id = f.id \
+         WHERE u.pipeline = ? AND c.dest = ? AND c.state = 'done' AND f.state IN ('pending', 'uploaded') \
+         AND u.state NOT IN ('finalized', 'abandoned', 'gone') {extra}"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    stmt.query_map(params![pipeline, dest], |r| r.get(0))?.collect()
+}
+
+/// Make the copies of `files` at `dest` pending, so they go up again.
+fn forget_copies(conn: &Connection, files: &[i64], dest: &str, dests: &[String]) -> rusqlite::Result<()> {
+    for id in files {
+        conn.execute(
+            "UPDATE copy SET state = 'pending', up_size = NULL, up_mtime_ns = NULL, etag = NULL, verified = NULL, \
+             uploaded_at = NULL, attempts = 0, next_attempt = NULL, last_error = NULL, alerted = 0 \
+             WHERE file_id = ? AND dest = ?",
+            params![id, dest],
+        )?;
+        refresh_file(conn, *id, dests)?;
+    }
+    Ok(())
+}
 
 fn refresh_file(conn: &Connection, file_id: i64, dests: &[String]) -> rusqlite::Result<()> {
     if dests.is_empty() {
@@ -1243,11 +1694,32 @@ fn reopen(conn: &Connection, unit_id: i64, reason: &str) -> rusqlite::Result<()>
     Ok(())
 }
 
+/// The first error, and how many more there were.
+pub fn summarize(errors: &[String]) -> String {
+    match errors {
+        [] => String::new(),
+        [only] => only.clone(),
+        [first, rest @ ..] => format!("{first} (and {} more)", rest.len()),
+    }
+}
+
+fn mark_unreadable(tx: &Connection, unit: &UnitRow, why: &str, changes: &mut ScanChanges) -> Result<()> {
+    tx.execute("UPDATE unit SET scan_error = ? WHERE id = ?", params![why, unit.id])?;
+    if unit.scan_error.is_none() {
+        changes.unreadable.push((unit.key.clone(), why.to_string()));
+    }
+    Ok(())
+}
+
+/// Fold one unit's observation in. With `error`, the observation is partial:
+/// what it saw counts, but nothing it did not see counts as gone.
+#[allow(clippy::too_many_arguments)]
 fn observe_unit(
     tx: &Connection,
     pipeline: &str,
     unit: Option<&UnitRow>,
     obs: &UnitObs,
+    error: Option<&str>,
     now: f64,
     dests: &[String],
     changes: &mut ScanChanges,
@@ -1260,18 +1732,37 @@ fn observe_unit(
     let (unit_id, state, existing) = match unit {
         None => {
             tx.execute(
-                "INSERT INTO unit (pipeline, key, first_seen, last_change, marker) VALUES (?, ?, ?, ?, ?)",
-                params![pipeline, obs.key, now, newest, obs.marker],
+                "INSERT INTO unit (pipeline, key, first_seen, last_change, marker, scan_error) \
+                 VALUES (?, ?, ?, ?, ?, ?)",
+                params![pipeline, obs.key, now, newest, obs.marker, error],
             )?;
             changes.new_units.push(obs.key.clone());
+            if let Some(why) = error {
+                changes.unreadable.push((obs.key.clone(), why.to_string()));
+            }
             (tx.last_insert_rowid(), OPEN.to_string(), BTreeMap::new())
         }
         Some(u) if u.state == ABANDONED => return Ok(()),
         Some(u) => {
-            tx.execute(
-                "UPDATE unit SET last_change = ?, marker = ?, present = 1 WHERE id = ?",
-                params![newest, obs.marker, u.id],
-            )?;
+            match error {
+                Some(why) => {
+                    // Part of it unread: never move activity back, never lose a marker.
+                    tx.execute(
+                        "UPDATE unit SET last_change = MAX(last_change, ?), marker = MAX(marker, ?), \
+                         present = 1, scan_error = ? WHERE id = ?",
+                        params![newest, obs.marker, why, u.id],
+                    )?;
+                    if u.scan_error.is_none() {
+                        changes.unreadable.push((obs.key.clone(), why.to_string()));
+                    }
+                }
+                None => {
+                    tx.execute(
+                        "UPDATE unit SET last_change = ?, marker = ?, present = 1, scan_error = NULL WHERE id = ?",
+                        params![newest, obs.marker, u.id],
+                    )?;
+                }
+            }
             let mut stmt = tx.prepare_cached("SELECT * FROM file WHERE unit_id = ?")?;
             let files = stmt
                 .query_map([u.id], FileRow::from_row)?
@@ -1280,7 +1771,7 @@ fn observe_unit(
             (u.id, u.state.clone(), files)
         }
     };
-    let mut reason = observe_files(tx, unit_id, obs, existing, dests, changes)?;
+    let mut reason = observe_files(tx, unit_id, obs, existing, error.is_none(), dests, changes)?;
     if state == GONE && !obs.files.is_empty() {
         reason = reason.or_else(|| Some("reappeared".into()));
     }
@@ -1293,12 +1784,14 @@ fn observe_unit(
     Ok(())
 }
 
-/// Update a unit's file rows; return why completion no longer holds.
+/// Update a unit's file rows; return why completion no longer holds. Only a
+/// `complete` observation can tell that a file is gone.
 fn observe_files(
     tx: &Connection,
     unit_id: i64,
     obs: &UnitObs,
     mut existing: BTreeMap<String, FileRow>,
+    complete: bool,
     dests: &[String],
     changes: &mut ScanChanges,
 ) -> Result<Option<String>> {
@@ -1357,6 +1850,9 @@ fn observe_files(
                 refresh_file(tx, row.id, dests)?;
             }
         }
+    }
+    if !complete {
+        return Ok(reason);
     }
     for row in existing.values() {
         if !row.present {
@@ -1448,7 +1944,7 @@ mod tests {
         Scan {
             units: units.into_iter().map(|u| (u.key.clone(), u)).collect(),
             scope: scope.map(|s| s.iter().map(|k| k.to_string()).collect()),
-            errors: 0,
+            ..Default::default()
         }
     }
 
@@ -1688,5 +2184,263 @@ mod tests {
         Journal::open(&path).unwrap().set_meta("schema_version", "99").unwrap();
         let err = Journal::open(&path).err().unwrap().to_string();
         assert!(err.contains("upgrade ferry"), "{err}");
+    }
+
+    #[test]
+    fn a_file_is_finalized_only_while_its_row_describes_those_bytes() {
+        let mut j = Journal::in_memory().unwrap();
+        j.apply_scan("p", &scan(vec![unit("u", &[("a", 1, 1)])], None), 1.0, &dests())
+            .unwrap();
+        copy_all(&mut j, "u", &["a", "b"]);
+        let f = j.files(j.find_unit("p", "u").unwrap().unwrap().id).unwrap()[0].clone();
+
+        assert!(
+            !j.finalize_file(f.id, 1, 2, false, None).unwrap(),
+            "a scan saw new bytes"
+        );
+        assert!(j.finalize_file(f.id, 1, 1, false, None).unwrap());
+        assert!(!j.finalize_file(f.id, 1, 1, false, None).unwrap(), "once");
+    }
+
+    #[test]
+    fn events_for_a_registrar_no_longer_configured_wait_until_dropped() {
+        let mut j = Journal::in_memory().unwrap();
+        j.apply_scan("p", &scan(vec![unit("u", &[("a", 1, 1)])], None), 1.0, &dests())
+            .unwrap();
+        let u = j.find_unit("p", "u").unwrap().unwrap();
+        j.set_unit(u.id, None, None, &[("state", Value::from(COMPLETE.to_string()))])
+            .unwrap();
+        let catalog = [("catalog".to_string(), true)];
+        assert!(
+            j.advance(
+                u.id,
+                0,
+                COMPLETE,
+                REGISTERING,
+                None,
+                "register",
+                &catalog,
+                "{}",
+                &[],
+                2.0
+            )
+            .unwrap()
+        );
+
+        assert!(j.orphaned_outbox("p", &["catalog".into()]).unwrap().is_empty());
+        assert_eq!(j.orphaned_outbox("p", &[]).unwrap(), [("catalog".to_string(), 1)]);
+        assert_eq!(j.discard_outbox("p", "catalog", false).unwrap(), 1);
+        assert!(
+            !j.required_done(u.id, 0, "register").unwrap(),
+            "a dry run drops nothing"
+        );
+
+        j.discard_outbox("p", "catalog", true).unwrap();
+        assert!(j.orphaned_outbox("p", &[]).unwrap().is_empty());
+        assert!(j.required_done(u.id, 0, "register").unwrap());
+    }
+
+    fn binding(identity: &str, verify: &str) -> Binding {
+        Binding {
+            name: "a".into(),
+            identity: identity.into(),
+            verify: verify.into(),
+        }
+    }
+
+    #[test]
+    fn a_destination_that_moved_waits_to_be_accepted_or_reset() {
+        let mut j = Journal::in_memory().unwrap();
+        j.apply_scan("p", &scan(vec![unit("u", &[("a", 1, 1)])], None), 1.0, &dests())
+            .unwrap();
+        copy_all(&mut j, "u", &["a", "b"]);
+        assert!(
+            j.bind_destinations("p", &[binding("s3://x/raw", "size")], &dests())
+                .unwrap()
+                .is_empty()
+        );
+
+        let moved = j
+            .bind_destinations("p", &[binding("s3://y/raw", "size")], &dests())
+            .unwrap();
+        assert_eq!(
+            moved,
+            [Moved {
+                name: "a".into(),
+                was: "s3://x/raw".into(),
+                now: "s3://y/raw".into()
+            }]
+        );
+        assert_eq!(
+            states(&j, "u"),
+            [("a".into(), "uploaded".into())],
+            "nothing changes on its own"
+        );
+
+        let preview = j
+            .reset_destination("p", &binding("s3://y/raw", "size"), &dests(), false)
+            .unwrap();
+        assert_eq!(preview.files, 1);
+        assert_eq!(j.destination("p", "a").unwrap().as_deref(), Some("s3://x/raw"));
+        j.reset_destination("p", &binding("s3://y/raw", "size"), &dests(), true)
+            .unwrap();
+        assert_eq!(states(&j, "u"), [("a".into(), "pending".into())]);
+        assert!(
+            j.bind_destinations("p", &[binding("s3://y/raw", "size")], &dests())
+                .unwrap()
+                .is_empty()
+        );
+
+        copy_all(&mut j, "u", &["a"]);
+        j.accept_destination("p", &binding("s3://z/raw", "size")).unwrap();
+        assert!(
+            j.bind_destinations("p", &[binding("s3://z/raw", "size")], &dests())
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            states(&j, "u"),
+            [("a".into(), "uploaded".into())],
+            "accepting keeps the copies"
+        );
+    }
+
+    #[test]
+    fn stronger_verification_sends_what_it_did_not_cover_again() {
+        let mut j = Journal::in_memory().unwrap();
+        j.apply_scan("p", &scan(vec![unit("u", &[("a", 1, 1)])], None), 1.0, &dests())
+            .unwrap();
+        copy_all(&mut j, "u", &["a", "b"]);
+        j.bind_destinations("p", &[binding("s3://x", "size")], &dests())
+            .unwrap();
+
+        j.bind_destinations("p", &[binding("s3://x", "sha256")], &dests())
+            .unwrap();
+        assert_eq!(states(&j, "u"), [("a".into(), "pending".into())]);
+        // Weaker again: sha256-verified copies satisfy size.
+        copy_all(&mut j, "u", &["a"]);
+        j.bind_destinations("p", &[binding("s3://x", "size")], &dests())
+            .unwrap();
+        assert_eq!(states(&j, "u"), [("a".into(), "uploaded".into())]);
+    }
+
+    #[test]
+    fn a_partial_look_keeps_what_it_did_not_see() {
+        let mut j = Journal::in_memory().unwrap();
+        j.apply_scan(
+            "p",
+            &scan(vec![unit("u", &[("a", 1, 1), ("b", 1, 1)])], None),
+            1.0,
+            &dests(),
+        )
+        .unwrap();
+        let mut partial = unit("u", &[("a", 1, 1)]);
+        partial.errors.push("cannot list /r/u/sub: Permission denied".into());
+
+        let changes = j.apply_scan("p", &scan(vec![partial], None), 2.0, &dests()).unwrap();
+        assert_eq!(
+            changes.unreadable,
+            [("u".to_string(), "cannot list /r/u/sub: Permission denied".to_string())]
+        );
+        assert!(changes.gone_files.is_empty());
+        assert_eq!(
+            states(&j, "u"),
+            [("a".into(), "pending".into()), ("b".into(), "pending".into())]
+        );
+        assert!(j.find_unit("p", "u").unwrap().unwrap().scan_error.is_some());
+
+        // Seen in full again: the error clears, and only now is b gone.
+        let changes = j
+            .apply_scan("p", &scan(vec![unit("u", &[("a", 1, 1)])], None), 3.0, &dests())
+            .unwrap();
+        assert_eq!(changes.gone_files, ["u/b"]);
+        assert!(j.find_unit("p", "u").unwrap().unwrap().scan_error.is_none());
+    }
+
+    #[test]
+    fn nothing_is_gone_after_a_scan_that_could_not_see_everything() {
+        let mut j = Journal::in_memory().unwrap();
+        j.apply_scan("p", &scan(vec![unit("u", &[("a", 1, 1)])], None), 1.0, &dests())
+            .unwrap();
+        let blind = Scan {
+            errors: vec!["cannot list /r: Input/output error".into()],
+            ..Default::default()
+        };
+        let changes = j.apply_scan("p", &blind, 2.0, &dests()).unwrap();
+        assert!(changes.gone_files.is_empty() && changes.gone_units.is_empty());
+        assert!(j.find_unit("p", "u").unwrap().unwrap().present);
+        assert_eq!(states(&j, "u"), [("a".into(), "pending".into())]);
+
+        // An error a regex layout cannot place could hide any unit's files.
+        let everywhere = Scan {
+            errors: vec!["cannot list /r/x: Permission denied".into()],
+            unattributed: true,
+            ..Default::default()
+        };
+        let changes = j.apply_scan("p", &everywhere, 3.0, &dests()).unwrap();
+        assert_eq!(changes.unreadable.len(), 1);
+        assert!(j.find_unit("p", "u").unwrap().unwrap().scan_error.is_some());
+    }
+
+    #[test]
+    fn each_generation_of_a_unit_is_announced_once() {
+        let mut j = Journal::in_memory().unwrap();
+        j.apply_scan("p", &scan(vec![unit("u", &[("a", 1, 1)])], None), 1.0, &dests())
+            .unwrap();
+        let u = j.find_unit("p", "u").unwrap().unwrap();
+        assert!(j.unannounced("p").unwrap().is_empty(), "open units are not delivered");
+        let registered = [
+            ("state", Value::from(REGISTERED.to_string())),
+            ("generation", Value::from(1)),
+        ];
+        j.set_unit(u.id, None, None, &registered).unwrap();
+
+        let chat = ["notifier:chat".to_string()];
+        assert!(j.announce(u.id, 1, &chat, "{}", 2.0).unwrap());
+        assert!(!j.announce(u.id, 1, &chat, "{}", 3.0).unwrap());
+        assert!(j.unannounced("p").unwrap().is_empty());
+        let queued: Vec<(String, String, bool)> = j
+            .outbox_for_unit(u.id)
+            .unwrap()
+            .into_iter()
+            .map(|o| (o.event, o.registrar, o.required))
+            .collect();
+        assert_eq!(queued, [("receipt".into(), "notifier:chat".into(), false)]);
+
+        j.set_unit(u.id, None, None, &[("generation", Value::from(2))]).unwrap();
+        assert_eq!(j.unannounced("p").unwrap()[0].receipt_gen, Some(1));
+        assert!(!j.announce(u.id, 1, &chat, "{}", 4.0).unwrap(), "a stale generation");
+        assert!(
+            j.announce(u.id, 2, &[], "", 5.0).unwrap(),
+            "announced with nobody listening"
+        );
+        assert_eq!(j.outbox_for_unit(u.id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn upgrading_a_version_1_journal_announces_nothing_already_delivered() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.sqlite3");
+        Journal::open(&path)
+            .unwrap()
+            .conn
+            .execute_batch(
+                "INSERT INTO unit (pipeline, key, state, generation, first_seen, last_change) VALUES \
+                 ('p', 'done', 'finalized', 3, 1, 1), ('p', 'waiting', 'registered', 1, 1, 1), \
+                 ('p', 'busy', 'open', 1, 1, 1);
+                 DROP INDEX unit_unannounced;
+                 ALTER TABLE unit DROP COLUMN receipt_gen;
+                 UPDATE meta SET value = '1' WHERE key = 'schema_version';",
+            )
+            .unwrap();
+
+        let j = Journal::open(&path).unwrap();
+        assert_eq!(j.get_meta("schema_version").unwrap(), Some(SCHEMA_VERSION.to_string()));
+        let gen_of = |key: &str| j.find_unit("p", key).unwrap().unwrap().receipt_gen;
+        assert_eq!(
+            (gen_of("done"), gen_of("waiting"), gen_of("busy")),
+            (Some(3), Some(1), None)
+        );
+        assert!(j.unannounced("p").unwrap().is_empty());
     }
 }

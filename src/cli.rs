@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::VERSION;
 use crate::config::{Config, Mode};
-use crate::journal::{ABANDONED, FINALIZED, GONE, Journal, OPEN};
+use crate::journal::{ABANDONED, Binding, FINALIZED, GONE, Journal, OPEN};
 use crate::logs::{self, LogGuard, LogSetup};
 use crate::runner::{Agent, AgentOptions};
 use crate::schedule::Schedule;
@@ -84,12 +84,51 @@ enum Command {
         #[arg(short = 'n', long, default_value_t = 5)]
         count: usize,
     },
+    /// Settle a destination whose settings now point somewhere new.
+    #[command(subcommand)]
+    Destination(DestinationCommand),
+    /// Events waiting for registrars.
+    #[command(subcommand)]
+    Outbox(OutboxCommand),
     /// Check a configuration.
     #[command(subcommand)]
     Config(ConfigCommand),
     /// Run `ferry watch` as a service that starts at boot.
     #[command(subcommand)]
     Service(ServiceCommand),
+}
+
+#[derive(Subcommand)]
+enum DestinationCommand {
+    /// Its new settings reach the same objects: its copies keep counting.
+    Accept {
+        pipeline: String,
+        destination: String,
+        /// Show what would change, changing nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Forget its copies: every file not yet finalized goes up again.
+    Reset {
+        pipeline: String,
+        destination: String,
+        /// Show what would change, changing nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum OutboxCommand {
+    /// Drop a registrar's undelivered events (one renamed or removed from the
+    /// config), so its units stop waiting on it.
+    Discard {
+        pipeline: String,
+        registrar: String,
+        /// Count them, changing nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -192,6 +231,21 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             }
         }
         Command::Schedule { count } => schedule(&load(&config)?, count),
+        Command::Destination(command) => destination_command(&load(&config)?, command),
+        Command::Outbox(OutboxCommand::Discard {
+            pipeline,
+            registrar,
+            dry_run,
+        }) => {
+            let journal = open_journal(&load(&config)?)?;
+            let count = journal.discard_outbox(&pipeline, &registrar, !dry_run)?;
+            if dry_run {
+                println!("[dry run] would drop {count} undelivered event(s) for {registrar} in {pipeline}.");
+            } else {
+                println!("Dropped {count} undelivered event(s) for {registrar} in {pipeline}.");
+            }
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Config(ConfigCommand::Validate) => validate(&load(&config)?),
         Command::Service(command) => service_command(&config, command),
     }
@@ -200,6 +254,61 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
 fn fail(message: &str) -> Result<ExitCode> {
     eprintln!("{message}");
     Ok(ExitCode::from(1))
+}
+
+fn destination_command(cfg: &Config, command: DestinationCommand) -> Result<ExitCode> {
+    let (pipeline, destination, dry_run, reset) = match command {
+        DestinationCommand::Accept {
+            pipeline,
+            destination,
+            dry_run,
+        } => (pipeline, destination, dry_run, false),
+        DestinationCommand::Reset {
+            pipeline,
+            destination,
+            dry_run,
+        } => (pipeline, destination, dry_run, true),
+    };
+    let Some(p) = cfg.pipeline(&pipeline) else {
+        return fail(&format!("no pipeline {pipeline:?}"));
+    };
+    let Some(d) = p.destinations.iter().find(|d| d.key() == destination) else {
+        return fail(&format!("{pipeline} has no destination {destination:?}"));
+    };
+    let binding = Binding {
+        name: destination.clone(),
+        identity: cfg.destination_identity(p, d),
+        verify: d.verify.as_str().into(),
+    };
+    let mut journal = open_journal(cfg)?;
+    let place = match journal.destination(&pipeline, &destination)? {
+        Some(was) if was != binding.identity => format!("{} (was {was})", binding.identity),
+        _ => binding.identity.clone(),
+    };
+    let tag = if dry_run { "[dry run] " } else { "" };
+    if reset {
+        let plan = journal.reset_destination(&pipeline, &binding, &p.destination_keys(), !dry_run)?;
+        let units = if plan.reopened.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "; {} unit(s) register again ({})",
+                plan.reopened.len(),
+                plan.reopened.join(", ")
+            )
+        };
+        println!(
+            "{tag}{pipeline}/{destination} points at {place}: {} file(s) go up again{units}; \
+             {} copies of finalized files stay as a record.",
+            plan.files, plan.kept
+        );
+    } else {
+        if !dry_run {
+            journal.accept_destination(&pipeline, &binding)?;
+        }
+        println!("{tag}{pipeline}/{destination} points at {place}; its copies count there.");
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 fn load(path: &Path) -> Result<Config> {

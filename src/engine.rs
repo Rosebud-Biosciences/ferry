@@ -14,30 +14,37 @@
 //! - Source files are kept, moved or deleted only once *every* destination holds
 //!   a verified copy, every required registrar has confirmed the unit, any
 //!   `finalize.after` grace has passed, and the files still match what was sent.
+//!
+//! Each generation of a unit then gets one receipt for the notifiers that take
+//! receipts: once its source files were dealt with, or as soon as only the
+//! grace period is left, so a long grace does not delay the news.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use futures::StreamExt;
 use futures::future::join_all;
-use object_store::ObjectStore;
+use object_store::{ObjectStore, ObjectStoreExt};
 use rusqlite::types::Value;
 use serde::Serialize;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::{Action, Fanout, Level, PipelineConfig, Upload, Verify};
-use crate::hooks::{Alerts, Registrar};
+use crate::config::{Action, Adopt, Fanout, Level, PipelineConfig, Upload, Verify};
+use crate::hooks::{Alerts, Notifier, Registrar};
 use crate::journal::{
-    COMPLETE, Candidate, FINALIZED, FileRow, Journal, NewTransfer, OPEN, OutboxRow, REGISTERED, REGISTERING,
-    ScanChanges, TransferRow, UPLOADED, UnitRow,
+    Binding, COMPLETE, Candidate, FINALIZED, FileRow, Journal, NewTransfer, OPEN, OutboxRow, REGISTERED, REGISTERING,
+    ScanChanges, TransferRow, UPLOADED, UnitRow, summarize,
 };
-use crate::manifest::{Alert, Event, EventKind, FileCopy, Manifest, ManifestDestination, ManifestFile, TransferEvent};
+use crate::manifest::{
+    Alert, Event, EventKind, FileCopy, Manifest, ManifestDestination, ManifestFile, Original, Receipt, ReceiptCopy,
+    TransferEvent,
+};
 use crate::stores::Location;
 use crate::transfer::{self, Fanout as FanoutResult, ReadError, Target, UploadSettings};
-use crate::units::Layout;
+use crate::units::{Layout, held_path};
 use crate::util::{Clock, human_bytes, human_duration, iso};
 use crate::winfs::held_open;
 
@@ -180,11 +187,50 @@ enum FinalizeError {
     Failed(anyhow::Error),
 }
 
+/// Who an outbox row is for.
+enum Recipient<'a> {
+    Registrar(&'a BoundRegistrar),
+    Notifier(&'a dyn Notifier),
+}
+
+/// A file's metadata, or `None` if it is not there.
+async fn stat(path: &Path) -> Result<Option<std::fs::Metadata>> {
+    match tokio::fs::metadata(path).await {
+        Ok(meta) => Ok(Some(meta)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// The file still has the size and mtime the journal recorded.
+fn same_stats(meta: &std::fs::Metadata, file: &FileRow) -> bool {
+    (meta.len() as i64, crate::util::mtime_ns(meta)) == (file.size, file.mtime_ns)
+}
+
+/// The outbox's name for a notifier, kept apart from registrar names.
+fn receipt_key(notifier: &dyn Notifier) -> String {
+    format!("notifier:{}", notifier.name())
+}
+
+/// What delivering `row` does, for logs and alerts.
+fn describe(row: &OutboxRow, unit: &str) -> String {
+    match row.registrar.strip_prefix("notifier:") {
+        Some(notifier) if row.event == EventKind::Receipt.as_str() => {
+            format!("post the receipt for {unit} to {notifier}")
+        }
+        _ => format!("{} {unit} with {}", row.event, row.registrar),
+    }
+}
+
 pub struct EngineParts {
     pub node: String,
     pub cfg: PipelineConfig,
     pub destinations: Vec<Destination>,
     pub registrars: Vec<BoundRegistrar>,
+    /// The notifiers that take receipts.
+    pub notifiers: Vec<Arc<dyn Notifier>>,
+    /// Where each destination points, checked against the journal.
+    pub bindings: Vec<Binding>,
     pub journal: Arc<Mutex<Journal>>,
     pub alerts: Arc<Alerts>,
     pub dry_run: bool,
@@ -201,6 +247,7 @@ pub struct Engine {
     pub layout: Arc<Layout>,
     pub dry_run: bool,
     pub clock: Arc<dyn Clock>,
+    notifiers: Vec<Arc<dyn Notifier>>,
     journal: Arc<Mutex<Journal>>,
     settings: UploadSettings,
     report: Mutex<PassReport>,
@@ -220,11 +267,45 @@ impl Engine {
             .filter(|d| d.required)
             .map(|d| d.key.clone())
             .collect();
-        parts
-            .journal
-            .lock()
-            .map_err(|_| anyhow!("journal lock poisoned"))?
-            .ensure_copies(&parts.cfg.name, &all_keys)?;
+        {
+            let mut journal = parts.journal.lock().map_err(|_| anyhow!("journal lock poisoned"))?;
+            let moved = journal.bind_destinations(&parts.cfg.name, &parts.bindings, &all_keys)?;
+            if !moved.is_empty() {
+                let pipeline = &parts.cfg.name;
+                let lines: Vec<String> = moved
+                    .iter()
+                    .map(|m| {
+                        format!(
+                            "destination {name} now points at {now}, but its copies were made at {was}. \
+                             If the objects are there too, run `ferry destination accept {pipeline} {name}`; \
+                             to send what is not yet finalized again, `ferry destination reset {pipeline} {name}` \
+                             (either with --dry-run first).",
+                            name = m.name,
+                            now = m.now,
+                            was = m.was,
+                        )
+                    })
+                    .collect();
+                bail!("pipeline {pipeline}: {}", lines.join(" "));
+            }
+            let configured: Vec<String> = parts.registrars.iter().map(|r| r.key.clone()).collect();
+            let orphans = journal.orphaned_outbox(&parts.cfg.name, &configured)?;
+            if !orphans.is_empty() {
+                let pipeline = &parts.cfg.name;
+                let lines: Vec<String> = orphans
+                    .iter()
+                    .map(|(name, count)| {
+                        format!(
+                            "{count} undelivered event(s) wait for registrar {name}, which is no longer \
+                             configured. Configure it again (by that name), or drop them with \
+                             `ferry outbox discard {pipeline} {name}` (with --dry-run first)."
+                        )
+                    })
+                    .collect();
+                bail!("pipeline {pipeline}: {}", lines.join(" "));
+            }
+            journal.ensure_copies(&parts.cfg.name, &all_keys)?;
+        }
         let started = parts.clock.now();
         Ok(Self {
             name: parts.cfg.name.clone(),
@@ -236,6 +317,7 @@ impl Engine {
             cfg: parts.cfg,
             destinations: parts.destinations,
             registrars: parts.registrars,
+            notifiers: parts.notifiers,
             alerts: parts.alerts,
             layout,
             dry_run: parts.dry_run,
@@ -329,15 +411,56 @@ impl Engine {
                 "unit {key} vanished before any of it was uploaded"
             );
         }
-        if scan.errors > 0 {
-            tracing::debug!(pipeline, "{} entries could not be read", scan.errors);
+        for (key, why) in &changes.unreadable {
+            tracing::warn!(pipeline, unit = key.as_str(), "cannot read all of {key}: {why}");
+            self.alerts.emit(Alert {
+                level: Level::Warning,
+                title: format!("{pipeline}: cannot read all of {key}; it waits until it can"),
+                message: why.clone(),
+                pipeline: Some(self.name.clone()),
+                unit: Some(key.clone()),
+            });
+        }
+        if scan.scope.is_none() {
+            self.track_scan_errors(&scan.errors)?;
         }
         Ok(changes)
+    }
+
+    /// Alert when a full scan first cannot read part of the tree outside any
+    /// unit (where no unit then counts as gone), and log when it can again.
+    fn track_scan_errors(&self, errors: &[String]) -> Result<()> {
+        let key = format!("scan_errors:{}", self.name);
+        let before = self.db().get_meta(&key)?.filter(|s| !s.is_empty());
+        let now = summarize(errors);
+        let root = self.cfg.root.display();
+        let pipeline = self.name.as_str();
+        match (&before, now.is_empty()) {
+            (None, false) => {
+                tracing::warn!(pipeline, "cannot read all of {root}: {now}");
+                self.alerts.emit(Alert {
+                    level: Level::Warning,
+                    title: format!("{pipeline}: cannot read all of {root}; no unit counts as gone meanwhile"),
+                    message: now.clone(),
+                    pipeline: Some(self.name.clone()),
+                    unit: None,
+                });
+            }
+            (Some(_), true) => tracing::info!(pipeline, "{root} reads in full again"),
+            _ => {}
+        }
+        if before.as_deref().unwrap_or_default() != now {
+            self.db().set_meta(&key, &now)?;
+        }
+        Ok(())
     }
 
     // -- completion ---------------------------------------------------------
     /// Why `unit` is not complete yet, or `None` if it is.
     fn why_open(&self, unit: &UnitRow, files: &[FileRow], now: f64) -> Option<String> {
+        if let Some(why) = &unit.scan_error {
+            return Some(format!("cannot read all of it: {why}"));
+        }
         if files.is_empty() {
             return Some("no files yet".into());
         }
@@ -440,8 +563,12 @@ impl Engine {
             .iter()
             .filter(|d| candidate.dests.contains(&d.key))
             .collect();
-        if self.cfg.adopt {
-            for dest in wanted.iter().filter(|d| d.verify == Verify::Size) {
+        if self.cfg.adopt != Adopt::Off {
+            // Size adoption cannot vouch for a hash-verified destination.
+            for dest in wanted
+                .iter()
+                .filter(|d| self.cfg.adopt == Adopt::Sha256 || d.verify == Verify::Size)
+            {
                 if self.db().is_adopted(unit.id, &dest.key)? {
                     continue;
                 }
@@ -687,12 +814,12 @@ impl Engine {
         }
         let prefix = dest.location.key(&unit.key)?;
         let store: Arc<dyn ObjectStore> = dest.location.store.inner.clone();
-        let mut remote: HashMap<String, u64> = HashMap::new();
+        let mut remote: HashMap<String, (u64, Option<String>)> = HashMap::new();
         let mut listing = store.list(Some(&prefix));
         while let Some(meta) = listing.next().await {
             match meta {
                 Ok(meta) => {
-                    remote.insert(meta.location.to_string(), meta.size);
+                    remote.insert(meta.location.to_string(), (meta.size, meta.e_tag));
                 }
                 Err(object_store::Error::NotFound { .. }) => break,
                 Err(e) => return Err(e.into()),
@@ -707,7 +834,10 @@ impl Engine {
             }
             let rel = Layout::remote_rel(&unit.key, &file.within);
             let key = dest.location.key(&rel)?.to_string();
-            if remote.get(&key) != Some(&(file.size as u64)) {
+            let Some((size, etag)) = remote.get(&key) else {
+                continue;
+            };
+            if *size != file.size as u64 {
                 continue;
             }
             let current = self
@@ -718,13 +848,27 @@ impl Engine {
             if current {
                 continue;
             }
+            let verified = if self.cfg.adopt == Adopt::Sha256 {
+                if !self.same_bytes(&file, dest, &rel).await? {
+                    tracing::info!(
+                        pipeline = self.name.as_str(),
+                        unit = unit.key.as_str(),
+                        "{} holds other bytes of the same size; uploading over it",
+                        dest.location.uri_for(&rel)
+                    );
+                    continue;
+                }
+                Verify::Sha256
+            } else {
+                Verify::Size
+            };
             self.db().record_copy(
                 file.id,
                 &dest.key,
                 file.size,
                 file.mtime_ns,
-                None,
-                Verify::Size.as_str(),
+                etag.as_deref(),
+                verified.as_str(),
                 now,
                 &self.all_keys,
             )?;
@@ -757,6 +901,32 @@ impl Engine {
             );
         }
         Ok(())
+    }
+
+    /// Whether the object at `rel` in `dest` reads back with the local file's
+    /// SHA-256 (hashing the file first if the journal has no current hash). A
+    /// file that changes while it is hashed does not match.
+    async fn same_bytes(&self, file: &FileRow, dest: &Destination, rel: &str) -> Result<bool> {
+        let local = match file.current_sha256() {
+            Some(hash) => hash.to_string(),
+            None => {
+                let path = self.src(file);
+                let hashed = tokio::task::spawn_blocking(move || transfer::hash_file(&path)).await??;
+                if !hashed.steady_at((file.size as u64, file.mtime_ns)) {
+                    return Ok(false);
+                }
+                self.db().set_hash(file.id, &hashed.sha256, file.size, file.mtime_ns)?;
+                hashed.sha256
+            }
+        };
+        let target = Target {
+            dest: dest.key.clone(),
+            location: dest.location.clone(),
+            rel: rel.to_string(),
+            verify: Verify::Sha256,
+        };
+        let remote = transfer::readback_sha256(&target).await.map_err(|e| anyhow!(e))?;
+        Ok(remote == local)
     }
 
     // -- registration -------------------------------------------------------
@@ -839,7 +1009,10 @@ impl Engine {
         let units = self.db().units(&self.name, Some(&[COMPLETE]))?;
         for unit in units {
             let files: Vec<FileRow> = self.db().files(unit.id)?.into_iter().filter(FileRow::live).collect();
-            if files.is_empty() || !self.db().copies_current(unit.id, &self.required_keys)? {
+            if unit.scan_error.is_some()
+                || files.is_empty()
+                || !self.db().copies_current(unit.id, &self.required_keys)?
+            {
                 continue;
             }
             let manifest = self.manifest(&unit, &files)?;
@@ -874,8 +1047,18 @@ impl Engine {
         Ok(queued)
     }
 
-    /// Hand due outbox rows to their registrars; promote confirmed units.
+    /// Hand due outbox rows to their registrars and notifiers, promote confirmed
+    /// units, and queue (and send) receipts for units now delivered.
     pub async fn deliver(&self) -> Result<usize> {
+        let mut delivered = self.deliver_due().await?;
+        self.promote_confirmed()?;
+        if self.queue_receipts()? > 0 {
+            delivered += self.deliver_due().await?;
+        }
+        Ok(delivered)
+    }
+
+    async fn deliver_due(&self) -> Result<usize> {
         let mut delivered = 0;
         let mut failing: BTreeSet<String> = BTreeSet::new();
         let rows = self.db().due_outbox(&self.name, self.now())?;
@@ -885,41 +1068,63 @@ impl Engine {
             if failing.contains(&row.registrar) {
                 continue;
             }
-            let Some(bound) = self.registrars.iter().find(|r| r.key == row.registrar) else {
-                tracing::warn!(
-                    pipeline = self.name.as_str(),
-                    "dropping a {} for {:?}, which is no longer configured",
-                    row.event,
-                    row.registrar
-                );
-                self.db().outbox_done(row.id, self.now())?;
+            let recipient = if row.event == EventKind::Receipt.as_str() {
+                self.notifiers
+                    .iter()
+                    .find(|n| receipt_key(n.as_ref()) == row.registrar)
+                    .map(|n| Recipient::Notifier(n.as_ref()))
+            } else {
+                self.registrars
+                    .iter()
+                    .find(|r| r.key == row.registrar)
+                    .map(Recipient::Registrar)
+            };
+            let Some(recipient) = recipient else {
+                // A receipt for a notifier that is gone is only a lost post. A
+                // registrar's event is never acknowledged on its behalf (startup
+                // refuses until an operator discards them).
+                if row.event == EventKind::Receipt.as_str() {
+                    tracing::warn!(
+                        pipeline = self.name.as_str(),
+                        "dropping a receipt for {:?}, which is no longer configured",
+                        row.registrar
+                    );
+                    self.db().outbox_done(row.id, self.now())?;
+                }
                 continue;
             };
             let event: Event = serde_json::from_str(&row.payload).context("outbox payload")?;
-            let unit_key = event.manifest.as_ref().map(|m| m.unit.clone()).unwrap_or_default();
+            let unit_key = event.unit().unwrap_or_default().to_string();
+            let what = describe(&row, &unit_key);
             if self.dry_run {
                 tracing::info!(
                     pipeline = self.name.as_str(),
                     unit = unit_key.as_str(),
-                    "[dry run] would {} {unit_key} with {}",
-                    row.event,
-                    row.registrar
+                    "[dry run] would {what}"
                 );
                 self.db().outbox_done(row.id, self.now())?;
                 delivered += 1;
                 continue;
             }
-            match bound.registrar.deliver(&event).await {
+            let result = match recipient {
+                Recipient::Registrar(bound) => bound.registrar.deliver(&event).await,
+                Recipient::Notifier(notifier) => notifier.notify(&event).await,
+            };
+            match result {
                 Ok(()) => {
                     self.db().outbox_done(row.id, self.now())?;
                     delivered += 1;
                 }
                 Err(e) => {
                     failing.insert(row.registrar.clone());
-                    self.delivery_failed(&row, &unit_key, &format!("{e:#}"))?;
+                    self.delivery_failed(&row, &unit_key, &what, &format!("{e:#}"))?;
                 }
             }
         }
+        Ok(delivered)
+    }
+
+    fn promote_confirmed(&self) -> Result<()> {
         let units = self.db().units(&self.name, Some(&[REGISTERING]))?;
         for unit in units {
             if !self.db().required_done(unit.id, unit.generation, "register")? {
@@ -941,10 +1146,10 @@ impl Engine {
                 );
             }
         }
-        Ok(delivered)
+        Ok(())
     }
 
-    fn delivery_failed(&self, row: &OutboxRow, unit: &str, error: &str) -> Result<()> {
+    fn delivery_failed(&self, row: &OutboxRow, unit: &str, what: &str, error: &str) -> Result<()> {
         let attempts = row.attempts as u32 + 1;
         self.db()
             .outbox_failed(row.id, error, self.now() + self.cfg.retry.backoff(attempts))?;
@@ -952,24 +1157,114 @@ impl Engine {
         tracing::error!(
             pipeline = self.name.as_str(),
             unit,
-            "could not {} {unit} with {} (attempt {attempts}): {error}",
-            row.event,
-            row.registrar
+            "could not {what} (attempt {attempts}): {error}"
         );
         if attempts >= self.cfg.retry.alert_after && !row.alerted {
             self.db().outbox_alerted(row.id)?;
             self.alerts.emit(Alert {
                 level: Level::Error,
-                title: format!(
-                    "{}: cannot {} {unit} with {} ({attempts} attempts)",
-                    self.name, row.event, row.registrar
-                ),
+                title: format!("{}: cannot {what} ({attempts} attempts)", self.name),
                 message: error.to_string(),
                 pipeline: Some(self.name.clone()),
                 unit: Some(unit.to_string()),
             });
         }
         Ok(())
+    }
+
+    // -- receipts -----------------------------------------------------------
+    /// Queue a receipt for each unit every destination now holds and every
+    /// required registrar has confirmed: once its source files were kept,
+    /// moved or deleted, or as soon as only `finalize.after` is left to wait.
+    /// A unit whose finalizing is failing waits; its alerts tell that story.
+    fn queue_receipts(&self) -> Result<usize> {
+        let now = self.now();
+        let keys: Vec<String> = self.notifiers.iter().map(|n| receipt_key(n.as_ref())).collect();
+        let mut queued = 0;
+        let units = self.db().unannounced(&self.name)?;
+        for unit in units {
+            let original = if unit.state == FINALIZED {
+                self.original(&unit, true, unit.finalized_at)
+            } else {
+                match self.finalize_due_at(&unit)? {
+                    Some(due) if due > now && unit.last_error.is_none() => self.original(&unit, false, Some(due)),
+                    _ => continue,
+                }
+            };
+            let payload = if keys.is_empty() {
+                String::new()
+            } else {
+                let mut event = Event::new(EventKind::Receipt, &self.node, Some(&self.name));
+                event.receipt = Some(self.receipt(&unit, original, now)?);
+                serde_json::to_string(&event)?
+            };
+            if self.db().announce(unit.id, unit.generation, &keys, &payload, now)? && !keys.is_empty() {
+                queued += 1;
+            }
+        }
+        Ok(queued)
+    }
+
+    fn original(&self, unit: &UnitRow, done: bool, at: Option<f64>) -> Original {
+        let action = self.cfg.finalize.action;
+        let path = match (action, &self.cfg.finalize.backup_root) {
+            (Action::Move, Some(root)) => Some(root.join(&unit.key).to_string_lossy().into_owned()),
+            _ => None,
+        };
+        Original {
+            action: action.as_str().into(),
+            done,
+            at: at.map(iso),
+            path,
+        }
+    }
+
+    fn receipt(&self, unit: &UnitRow, original: Original, now: f64) -> Result<Receipt> {
+        let files: Vec<FileRow> = self.db().files(unit.id)?.into_iter().filter(FileRow::live).collect();
+        let copies = self.db().unit_copies(unit.id)?;
+        let destinations = self
+            .destinations
+            .iter()
+            .map(|d| {
+                let hashed = files.iter().all(|f| {
+                    copies.get(&f.id).into_iter().flatten().any(|c| {
+                        c.dest == d.key && c.is_current(f) && c.verified.as_deref() == Some(Verify::Sha256.as_str())
+                    })
+                });
+                ReceiptCopy {
+                    name: d.key.clone(),
+                    uri: d.location.uri_for(&unit.key),
+                    verified: if hashed { Verify::Sha256 } else { Verify::Size }.as_str().into(),
+                }
+            })
+            .collect();
+        let confirmed: BTreeSet<String> = self
+            .db()
+            .outbox_for_unit(unit.id)?
+            .into_iter()
+            .filter(|o| {
+                o.event == EventKind::Register.as_str() && o.generation == unit.generation && o.done_at.is_some()
+            })
+            .map(|o| o.registrar)
+            .collect();
+        Ok(Receipt {
+            unit: unit.key.clone(),
+            generation: unit.generation,
+            update: unit.receipt_gen.is_some(),
+            files: files.len(),
+            bytes: files.iter().map(|f| f.size).sum(),
+            first_seen: iso(unit.first_seen),
+            delivered: iso(now),
+            duration_s: (now - unit.first_seen).max(0.0).round() as u64,
+            destinations,
+            registrars: self
+                .registrars
+                .iter()
+                .filter(|r| confirmed.contains(&r.key))
+                .map(|r| r.key.clone())
+                .collect(),
+            original,
+        })
     }
 
     /// Hand failed transfers to registrars' audit trails, once each.
@@ -999,7 +1294,7 @@ impl Engine {
 
     // -- finalize -----------------------------------------------------------
     fn finalize_due_at(&self, unit: &UnitRow) -> Result<Option<f64>> {
-        if !self.db().copies_current(unit.id, &self.all_keys)? {
+        if unit.scan_error.is_some() || !self.db().copies_current(unit.id, &self.all_keys)? {
             return Ok(None);
         }
         let grace = self.cfg.finalize.after.map_or(0.0, |d| d.as_secs_f64());
@@ -1032,6 +1327,29 @@ impl Engine {
             .into_iter()
             .filter(|f| f.state == UPLOADED)
             .collect();
+        if action != Action::Keep && !self.dry_run {
+            match self.revalidate(&unit, &rows).await {
+                Ok(lost) if !lost.is_empty() => {
+                    for (file_id, dest, why) in &lost {
+                        self.db().copy_lost(*file_id, dest, why, &self.all_keys)?;
+                    }
+                    let why = lost[0].2.clone();
+                    tracing::warn!(
+                        pipeline = self.name.as_str(),
+                        unit = unit.key.as_str(),
+                        "not finalizing {}: {why}; sending it again",
+                        unit.key
+                    );
+                    self.report(|r| r.reopened.push((unit.key.clone(), why)));
+                    return Ok(false);
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    self.finalize_failed(&unit, &format!("cannot check its copies: {e:#}"))?;
+                    return Ok(false);
+                }
+            }
+        }
         let results = join_all(rows.iter().map(|f| self.finalize_file(&unit, f, action))).await;
         let mut changed = Vec::new();
         let mut failure = None;
@@ -1116,23 +1434,24 @@ impl Engine {
             .acquire()
             .await
             .map_err(|e| FinalizeError::Failed(e.into()))?;
+        let fail = |e: anyhow::Error| FinalizeError::Failed(e);
         let src = self.src(file);
-        let meta = match tokio::fs::metadata(&src).await {
-            Ok(meta) => Some(meta),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => return Err(FinalizeError::Failed(e.into())),
-        };
-        if let Some(meta) = &meta
-            && (meta.len() as i64, crate::util::mtime_ns(meta)) != (file.size, file.mtime_ns)
+        let held = held_path(&src);
+        let src_meta = stat(&src).await.map_err(fail)?;
+        let held_meta = stat(&held).await.map_err(fail)?;
+        // A held copy is what an interrupted finalize set aside; without one,
+        // the source must still be the bytes that were uploaded.
+        if held_meta.is_none()
+            && let Some(meta) = &src_meta
+            && !same_stats(meta, file)
         {
             return Err(FinalizeError::Changed(
                 file.id,
                 format!("{} changed after it was uploaded", file.within),
             ));
         }
-        let fail = |e: anyhow::Error| FinalizeError::Failed(e);
         if action == Action::Keep {
-            return self.db().finalize_file(file.id, meta.is_some(), None).map_err(fail);
+            return self.finalized(file, src_meta.is_some(), None).map_err(fail);
         }
         if self.dry_run {
             let verb = if action == Action::Move { "move" } else { "delete" };
@@ -1142,75 +1461,84 @@ impl Engine {
                 "[dry run] would {verb} {}",
                 src.display()
             );
-            return self.db().finalize_file(file.id, meta.is_some(), None).map_err(fail);
+            return self.finalized(file, src_meta.is_some(), None).map_err(fail);
+        }
+        let dst = match action {
+            Action::Move => Some(
+                self.cfg
+                    .finalize
+                    .backup_root
+                    .as_deref()
+                    .ok_or_else(|| fail(anyhow!("move needs a backup_root")))?
+                    .join(&file.rel),
+            ),
+            _ => None,
+        };
+        if held_meta.is_none() && src_meta.is_none() {
+            return self.finalize_missing(file, &src, dst.as_deref()).await;
+        }
+        if held_meta.is_none() {
+            // Set it aside by a rename first: a writer that comes back now
+            // makes a new file rather than changing the bytes that go.
+            tokio::fs::rename(&src, &held)
+                .await
+                .map_err(|e| fail(anyhow!("cannot set {} aside to finalize it: {e}", src.display())))?;
+        }
+        // Only the uploaded bytes may go.
+        match self.held_mismatch(&held, file, action).await {
+            Ok(None) => {}
+            Ok(Some(why)) => {
+                self.restore(&src, &held).await.map_err(fail)?;
+                return Err(FinalizeError::Changed(file.id, format!("{} {why}", file.within)));
+            }
+            Err(e) => {
+                self.restore(&src, &held).await.map_err(fail)?;
+                return Err(fail(e));
+            }
         }
         let src_text = src.to_string_lossy().into_owned();
-        let now = self.now();
-        if action == Action::Delete {
-            if meta.is_some() {
-                tokio::fs::remove_file(&src).await.map_err(|e| fail(e.into()))?;
-                self.record(NewTransfer {
-                    pipeline: &self.name,
-                    unit_id: Some(unit.id),
-                    rel: &file.rel,
-                    op: "delete",
-                    status: "ok",
-                    src: &src_text,
-                    at: now,
-                    ..Default::default()
-                })
-                .map_err(fail)?;
-            }
-            return self.db().finalize_file(file.id, false, None).map_err(fail);
-        }
-        let backup_root = self
-            .cfg
-            .finalize
-            .backup_root
-            .clone()
-            .ok_or_else(|| fail(anyhow!("move needs a backup_root")))?;
-        let dst = backup_root.join(&file.rel);
-        let dst_text = dst.to_string_lossy().into_owned();
-        if meta.is_none() {
-            // Moved already -- a crash between the move and recording it -- or
-            // removed by someone else; every destination has it either way.
-            let kept = std::fs::metadata(&dst).ok().map(|m| m.len() as i64);
-            let backup = (kept == Some(file.size)).then_some(dst_text.as_str());
-            return self.db().finalize_file(file.id, false, backup).map_err(fail);
-        }
+        let dst_text = dst.as_ref().map(|d| d.to_string_lossy().into_owned());
+        let op = if dst.is_some() { "move" } else { "delete" };
         let started = std::time::Instant::now();
-        let (from, to) = (src.clone(), dst.clone());
-        let moved = tokio::task::spawn_blocking(move || transfer::move_file(&from, &to))
-            .await
-            .map_err(|e| fail(e.into()))?;
-        match moved {
+        let outcome = match &dst {
+            None => tokio::fs::remove_file(&held).await.map(|()| file.size as u64),
+            Some(dst) => {
+                let (from, to) = (held.clone(), dst.clone());
+                let sha256 = file.current_sha256().map(str::to_string);
+                tokio::task::spawn_blocking(move || transfer::move_file(&from, &to, sha256.as_deref()))
+                    .await
+                    .map_err(|e| fail(e.into()))?
+            }
+        };
+        match outcome {
             Ok(bytes) => {
                 self.record(NewTransfer {
                     pipeline: &self.name,
                     unit_id: Some(unit.id),
                     rel: &file.rel,
-                    op: "move",
+                    op,
                     status: "ok",
                     src: &src_text,
-                    dst: &dst_text,
+                    dst: dst_text.as_deref().unwrap_or_default(),
                     bytes: Some(bytes as i64),
                     duration_ms: Some(started.elapsed().as_millis() as i64),
                     at: self.now(),
                     ..Default::default()
                 })
                 .map_err(fail)?;
-                self.db().finalize_file(file.id, false, Some(&dst_text)).map_err(fail)
+                self.finalized(file, false, dst_text.as_deref()).map_err(fail)
             }
             Err(e) => {
+                self.restore(&src, &held).await.map_err(fail)?;
                 let error = e.to_string();
                 self.record(NewTransfer {
                     pipeline: &self.name,
                     unit_id: Some(unit.id),
                     rel: &file.rel,
-                    op: "move",
+                    op,
                     status: "failed",
                     src: &src_text,
-                    dst: &dst_text,
+                    dst: dst_text.as_deref().unwrap_or_default(),
                     error: Some(&error),
                     at: self.now(),
                     ..Default::default()
@@ -1219,6 +1547,157 @@ impl Engine {
                 Err(fail(e.into()))
             }
         }
+    }
+
+    /// Why the file set aside at `held` is not the bytes that were uploaded,
+    /// if it is not: the same size and mtime, and before a delete the same
+    /// SHA-256 (a rewrite can keep both).
+    async fn held_mismatch(&self, held: &Path, file: &FileRow, action: Action) -> Result<Option<String>> {
+        let meta = tokio::fs::metadata(held).await?;
+        if !same_stats(&meta, file) {
+            return Ok(Some("changed after it was uploaded".into()));
+        }
+        if action != Action::Delete {
+            return Ok(None);
+        }
+        let Some(want) = file.current_sha256().map(str::to_string) else {
+            bail!("{} has no recorded SHA-256 to check before deleting it", file.within);
+        };
+        let path = held.to_path_buf();
+        let hashed = tokio::task::spawn_blocking(move || transfer::hash_file(&path)).await??;
+        if !hashed.steady_at((file.size as u64, file.mtime_ns)) {
+            return Ok(Some("changed while it was checked".into()));
+        }
+        if hashed.sha256 != want {
+            return Ok(Some(
+                "holds other bytes than were uploaded, at the same size and time".into(),
+            ));
+        }
+        Ok(None)
+    }
+
+    /// Put a file set aside back under its name -- or, if a new file took the
+    /// name meanwhile, beside it -- so nothing stays hidden as held.
+    async fn restore(&self, src: &Path, held: &Path) -> Result<()> {
+        let (src, held) = (src.to_path_buf(), held.to_path_buf());
+        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            for n in 0u32.. {
+                let back = if n == 0 {
+                    src.clone()
+                } else {
+                    let mut name = src.as_os_str().to_owned();
+                    name.push(format!(".ferry-restored-{n}"));
+                    PathBuf::from(name)
+                };
+                // A hard link never replaces an existing file; not every file
+                // system has them, so fall back to a checked rename.
+                match std::fs::hard_link(&held, &back) {
+                    Ok(()) => return std::fs::remove_file(&held),
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(_) if !back.exists() => return std::fs::rename(&held, &back),
+                    Err(_) => continue,
+                }
+            }
+            unreachable!("ran out of names")
+        })
+        .await??;
+        Ok(())
+    }
+
+    /// Neither the source nor a held copy is there: deleted or moved already
+    /// (a crash before it was recorded), or removed by someone else.
+    async fn finalize_missing(&self, file: &FileRow, src: &Path, dst: Option<&Path>) -> Result<(), FinalizeError> {
+        let fail = |e: anyhow::Error| FinalizeError::Failed(e);
+        let Some(dst) = dst else {
+            // Every destination holds it: the copies were checked just now.
+            return self.finalized(file, false, None).map_err(fail);
+        };
+        // Only a backup that holds the uploaded bytes counts as the move.
+        let matches = match tokio::fs::metadata(dst).await {
+            Ok(meta) if meta.len() as i64 == file.size => match file.current_sha256() {
+                Some(want) => {
+                    let path = dst.to_path_buf();
+                    let hashed = tokio::task::spawn_blocking(move || transfer::hash_file(&path))
+                        .await
+                        .map_err(|e| fail(e.into()))?
+                        .map_err(|e| fail(e.into()))?;
+                    hashed.sha256 == want
+                }
+                None => true,
+            },
+            _ => false,
+        };
+        if !matches {
+            return Err(fail(anyhow!(
+                "{} is gone, and {} does not hold what was uploaded; put one of them back, or abandon the unit",
+                src.display(),
+                dst.display()
+            )));
+        }
+        self.finalized(file, false, Some(&dst.to_string_lossy())).map_err(fail)
+    }
+
+    /// Record a file finalized, if its row still describes those bytes.
+    fn finalized(&self, file: &FileRow, present: bool, backup: Option<&str>) -> Result<()> {
+        if !self
+            .db()
+            .finalize_file(file.id, file.size, file.mtime_ns, present, backup)?
+        {
+            tracing::warn!(
+                pipeline = self.name.as_str(),
+                "{} changed while it was finalized; the new bytes go up next",
+                file.rel
+            );
+        }
+        Ok(())
+    }
+
+    /// HEAD every copy of `files`: each must still be there with the size
+    /// sent and, where one was recorded, the same ETag -- an object deleted or
+    /// overwritten since it was verified does not count. Returns those that
+    /// fail, as (file, destination, why).
+    async fn revalidate(&self, unit: &UnitRow, files: &[FileRow]) -> Result<Vec<(i64, String, String)>> {
+        let copies = self.db().unit_copies(unit.id)?;
+        let mut checks = Vec::new();
+        for file in files {
+            for dest in &self.destinations {
+                let etag = copies
+                    .get(&file.id)
+                    .and_then(|cs| cs.iter().find(|c| c.dest == dest.key))
+                    .and_then(|c| c.etag.clone());
+                let rel = Layout::remote_rel(&unit.key, &file.within);
+                checks.push((
+                    file.id,
+                    file.size as u64,
+                    rel,
+                    dest.key.clone(),
+                    dest.location.clone(),
+                    etag,
+                ));
+            }
+        }
+        let results: Vec<Result<Option<(i64, String, String)>>> = futures::stream::iter(checks)
+            .map(|(file_id, size, rel, dest, location, etag)| async move {
+                let uri = location.uri_for(&rel);
+                let why = match location.store.inner.head(&location.key(&rel)?).await {
+                    Ok(meta) if meta.size != size => Some(format!("{uri} holds {} bytes, not {size}", meta.size)),
+                    Ok(meta) if etag.is_some() && meta.e_tag != etag => {
+                        Some(format!("{uri} was overwritten since it was verified"))
+                    }
+                    Ok(_) => None,
+                    Err(object_store::Error::NotFound { .. }) => Some(format!("{uri} is gone")),
+                    Err(e) => return Err(anyhow::Error::from(e)),
+                };
+                Ok(why.map(|why| (file_id, dest, why)))
+            })
+            .buffer_unordered(16)
+            .collect()
+            .await;
+        let mut lost = Vec::new();
+        for result in results {
+            lost.extend(result?);
+        }
+        Ok(lost)
     }
 
     fn finalize_failed(&self, unit: &UnitRow, error: &str) -> Result<()> {
@@ -1311,6 +1790,12 @@ impl Engine {
                         Some(why) if !files.is_empty() => format!("waiting: {why}"),
                         _ => continue,
                     }
+                }
+                COMPLETE | REGISTERED if unit.scan_error.is_some() => {
+                    format!(
+                        "waiting: cannot read all of it: {}",
+                        unit.scan_error.as_deref().unwrap_or_default()
+                    )
                 }
                 COMPLETE | REGISTERED => {
                     let gate: &[String] = if unit.state == COMPLETE {

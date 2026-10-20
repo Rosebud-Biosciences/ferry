@@ -13,9 +13,10 @@ use tokio_util::sync::CancellationToken;
 use crate::config::{Config, Mode};
 use crate::engine::{self, BoundRegistrar, Engine, EngineParts, PassReport};
 use crate::hooks::{Alerts, ExecHook, Notifier, Registrar, exec_hook, notifier_from, registrar_from};
-use crate::journal::Journal;
+use crate::journal::{Binding, Journal};
 use crate::lock::StateLock;
 use crate::logs::{ship_logs, write_heartbeat};
+use crate::manifest::EventKind;
 use crate::schedule::{Schedule, sleep_until};
 use crate::stores::{Location, Store, open_stores};
 use crate::stream::{self, StreamOptions};
@@ -76,17 +77,20 @@ impl Agent {
             Journal::open(&config.journal_path())?
         };
         let journal = Arc::new(Mutex::new(journal));
-        let notifiers = match (dry_run, options.notifiers) {
-            (true, _) => Vec::new(),
-            (false, Some(given)) => given,
-            (false, None) => config
-                .notifiers
-                .iter()
-                .enumerate()
-                .map(|(i, n)| notifier_from(n, i))
-                .collect(),
+        let notifiers: Vec<Arc<dyn Notifier>> = match options.notifiers {
+            Some(given) => given,
+            None => config.notifiers.iter().map(notifier_from).collect(),
         };
-        let alerts = Arc::new(Alerts::new(&config.node, notifiers));
+        // A dry run sends nothing; it still shows which receipts would go out.
+        let alerts = Arc::new(Alerts::new(
+            &config.node,
+            if dry_run { Vec::new() } else { notifiers.clone() },
+        ));
+        let receipts: Vec<Arc<dyn Notifier>> = notifiers
+            .iter()
+            .filter(|n| n.wants(EventKind::Receipt))
+            .cloned()
+            .collect();
         let stores = open_stores(&config.stores)?;
         let mut engines = Vec::new();
         for p in &config.pipelines {
@@ -120,6 +124,16 @@ impl Agent {
                 cfg: p.clone(),
                 destinations,
                 registrars,
+                notifiers: receipts.clone(),
+                bindings: p
+                    .destinations
+                    .iter()
+                    .map(|d| Binding {
+                        name: d.key().to_string(),
+                        identity: config.destination_identity(p, d),
+                        verify: d.verify.as_str().into(),
+                    })
+                    .collect(),
                 journal: journal.clone(),
                 alerts: alerts.clone(),
                 dry_run,

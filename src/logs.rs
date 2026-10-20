@@ -12,7 +12,8 @@ use anyhow::{Context, Result};
 use aws_lc_rs::digest;
 use bytes::Bytes;
 use chrono::NaiveDate;
-use object_store::{ObjectStoreExt, PutPayload};
+use object_store::{ObjectStoreExt, PutPayload, WriteMultipart};
+use tokio::io::AsyncReadExt;
 use tracing_appender::non_blocking::{NonBlockingBuilder, WorkerGuard};
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::layer::SubscriberExt;
@@ -100,7 +101,12 @@ pub fn log_files(dir: &Path) -> Vec<(NaiveDate, PathBuf)> {
     found
 }
 
-/// Upload every finished day's log not yet shipped; tell the log registrars.
+/// Logs up to this size go up in one PUT; bigger ones stream in parts of it.
+const LOG_PART: usize = 8 * 1024 * 1024;
+
+/// Upload every finished day's log not yet shipped, then tell the log
+/// registrars -- each one any log it has not taken yet, so one that was down
+/// hears about it on a later round.
 pub async fn ship_logs(
     journal: &Mutex<Journal>,
     location: &Location,
@@ -109,6 +115,7 @@ pub async fn ship_logs(
     hooks: &[ExecHook],
     today: NaiveDate,
 ) -> Vec<ShippedLog> {
+    let names: Vec<String> = hooks.iter().map(|h| h.name.clone()).collect();
     let mut shipped = Vec::new();
     for (day, path) in log_files(log_dir) {
         let name = path
@@ -124,46 +131,119 @@ pub async fn ship_logs(
         }
         match ship_one(location, node, &path, &name).await {
             Ok((uri, size, sha256)) => {
-                if let Ok(j) = journal.lock()
-                    && let Err(e) = j.record_shipped(&name, &uri, size as i64, &sha256, now_secs())
+                if let Ok(mut j) = journal.lock()
+                    && let Err(e) = j.record_shipped(&name, &uri, size as i64, &sha256, now_secs(), &names)
                 {
                     tracing::warn!("could not record shipping {name}: {e:#}");
                 }
                 tracing::info!("shipped log {name} to {uri}");
-                let log = ShippedLog {
+                shipped.push(ShippedLog {
                     node: node.to_string(),
                     name: name.clone(),
                     day: day.to_string(),
                     uri,
                     size: size as i64,
                     sha256,
-                };
-                let mut event = Event::new(EventKind::Log, node, None);
-                event.log = Some(log.clone());
-                for hook in hooks {
-                    if let Err(e) = hook.run(&event).await {
-                        tracing::warn!("{} could not register log {name}: {e:#}", hook.name);
-                    }
-                }
-                shipped.push(log);
+                });
             }
             Err(e) => tracing::warn!("could not ship {name}: {e:#}"),
+        }
+    }
+    let pending = journal
+        .lock()
+        .ok()
+        .and_then(|j| j.undelivered_logs(&names).ok())
+        .unwrap_or_default();
+    for (row, hook_name) in pending {
+        let Some(hook) = hooks.iter().find(|h| h.name == hook_name) else {
+            continue;
+        };
+        let day = row
+            .name
+            .strip_prefix("ferry.")
+            .and_then(|n| n.strip_suffix(".jsonl"))
+            .unwrap_or_default()
+            .to_string();
+        let mut event = Event::new(EventKind::Log, node, None);
+        event.log = Some(ShippedLog {
+            node: node.to_string(),
+            name: row.name.clone(),
+            day,
+            uri: row.uri,
+            size: row.size,
+            sha256: row.sha256,
+        });
+        let result = hook.run(&event).await;
+        if let Ok(j) = journal.lock() {
+            let recorded = match &result {
+                Ok(()) => j.log_delivered(&row.name, &hook_name, now_secs()),
+                Err(e) => j.log_delivery_failed(&row.name, &hook_name, &format!("{e:#}")),
+            };
+            if let Err(e) = recorded {
+                tracing::warn!("could not record telling {hook_name} about {}: {e:#}", row.name);
+            }
+        }
+        if let Err(e) = result {
+            tracing::warn!(
+                "{hook_name} could not register log {} (retried next round): {e:#}",
+                row.name
+            );
         }
     }
     shipped
 }
 
+/// Upload one log, hashing on the way; small ones in one PUT, others in parts
+/// so a big log never sits in memory whole.
 async fn ship_one(location: &Location, node: &str, path: &Path, name: &str) -> Result<(String, u64, String)> {
-    let body = Bytes::from(tokio::fs::read(path).await?);
-    let sha256 = hex::encode(digest::digest(&digest::SHA256, &body).as_ref());
-    let size = body.len() as u64;
     let rel = format!("{node}/{name}");
-    location
-        .store
-        .inner
-        .put(&location.key(&rel)?, PutPayload::from(body))
-        .await?;
-    Ok((location.uri_for(&rel), size, sha256))
+    let key = location.key(&rel)?;
+    let store = &location.store.inner;
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut ctx = digest::Context::new(&digest::SHA256);
+    let mut chunk = vec![0u8; LOG_PART];
+    let first = read_full(&mut file, &mut chunk).await?;
+    ctx.update(&chunk[..first]);
+    let mut size = first as u64;
+    if first < LOG_PART {
+        chunk.truncate(first);
+        store.put(&key, PutPayload::from(Bytes::from(chunk))).await?;
+    } else {
+        let mut writer = WriteMultipart::new_with_chunk_size(store.put_multipart(&key).await?, LOG_PART);
+        writer.put(Bytes::copy_from_slice(&chunk));
+        let streamed: Result<()> = async {
+            loop {
+                let n = read_full(&mut file, &mut chunk).await?;
+                if n == 0 {
+                    return Ok(());
+                }
+                ctx.update(&chunk[..n]);
+                size += n as u64;
+                writer.wait_for_capacity(2).await?;
+                writer.put(Bytes::copy_from_slice(&chunk[..n]));
+            }
+        }
+        .await;
+        if let Err(e) = streamed {
+            let _ = writer.abort().await;
+            return Err(e);
+        }
+        writer.finish().await?;
+    }
+    Ok((location.uri_for(&rel), size, hex::encode(ctx.finish().as_ref())))
+}
+
+/// Fill `buf` from `file` unless it ends first; how many bytes were read.
+async fn read_full(file: &mut tokio::fs::File, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        let n = file.read(&mut buf[filled..]).await?;
+        if n == 0 {
+            break;
+        }
+        filled += n;
+    }
+    Ok(filled)
 }
 
 /// Overwrite `{node}/heartbeat.json`: proof of life, plus a status summary.
@@ -234,5 +314,60 @@ mod tests {
                 .await
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn a_big_log_streams_up_in_parts() {
+        let logs = tempfile::tempdir().unwrap();
+        let remote = tempfile::tempdir().unwrap();
+        let body: Vec<u8> = (0..LOG_PART + LOG_PART / 2).map(|i| (i % 251) as u8).collect();
+        std::fs::write(logs.path().join("ferry.2026-10-06.jsonl"), &body).unwrap();
+        let journal = Mutex::new(Journal::in_memory().unwrap());
+        let location = local(remote.path()).child("logs").unwrap();
+        let today = NaiveDate::from_ymd_opt(2026, 10, 8).unwrap();
+
+        let shipped = ship_logs(&journal, &location, logs.path(), "pc1", &[], today).await;
+        assert_eq!(shipped[0].size as usize, body.len());
+        assert_eq!(
+            shipped[0].sha256,
+            hex::encode(digest::digest(&digest::SHA256, &body).as_ref())
+        );
+        assert_eq!(
+            std::fs::read(remote.path().join("logs/pc1/ferry.2026-10-06.jsonl")).unwrap(),
+            body
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_log_registrar_that_was_down_hears_about_it_next_round() {
+        let logs = tempfile::tempdir().unwrap();
+        let remote = tempfile::tempdir().unwrap();
+        std::fs::write(logs.path().join("ferry.2026-10-06.jsonl"), "{}\n").unwrap();
+        let journal = Mutex::new(Journal::in_memory().unwrap());
+        let location = local(remote.path()).child("logs").unwrap();
+        let today = NaiveDate::from_ymd_opt(2026, 10, 8).unwrap();
+        let calls = logs.path().join("calls");
+        let catalog = |script: &str| {
+            crate::hooks::exec_hook(
+                "catalog".into(),
+                &[
+                    "sh".into(),
+                    "-c".into(),
+                    format!("echo x >> '{}'; {script}", calls.display()),
+                ],
+                &None,
+                &Default::default(),
+                std::time::Duration::from_secs(10),
+            )
+        };
+        let count = || std::fs::read_to_string(&calls).unwrap_or_default().lines().count();
+
+        ship_logs(&journal, &location, logs.path(), "pc1", &[catalog("exit 1")], today).await;
+        assert_eq!(count(), 1);
+        ship_logs(&journal, &location, logs.path(), "pc1", &[catalog("exit 0")], today).await;
+        assert_eq!(count(), 2, "told again after failing");
+        ship_logs(&journal, &location, logs.path(), "pc1", &[catalog("exit 0")], today).await;
+        assert_eq!(count(), 2, "and only until it took it");
     }
 }

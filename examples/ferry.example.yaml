@@ -45,6 +45,8 @@ pipelines:
     upload: unit                   # wait for the whole unit, then upload it
     settle: 2m                     # a file is settled once its mtime is this old
     unit_idle: 30m                 # complete once nothing has changed for this long
+    adopt: sha256                  # after a lost journal, count objects already there that
+                                   # read back the same (off: upload again; size: keep only)
     finalize:
       action: move                 # keep | move | delete
       backup_root: F:/Cytation5Raw
@@ -107,3 +109,6 @@ logs:
 notifiers:
   - webhook: ${FERRY_ALERT_WEBHOOK}   # Slack-compatible incoming webhook
     min_level: warning               # info also sends each pass's digest
+  - name: arrivals                   # one post per unit, once it is delivered
+    webhook: ${FERRY_RECEIPTS_WEBHOOK}
+    events: [receipt]

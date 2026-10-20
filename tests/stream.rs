@@ -33,13 +33,17 @@ struct Watching {
 
 impl Watching {
     fn start(h: &Harness, cfg: &Config) -> Self {
+        Self::start_with(cfg, h.options(false))
+    }
+
+    fn start_with(cfg: &Config, base: AgentOptions) -> Self {
         let options = AgentOptions {
             clock: Arc::new(SystemClock),
             stream: StreamOptions {
                 digest_every: Duration::from_secs(3600),
                 grace: Duration::from_secs(5),
             },
-            ..h.options(false)
+            ..base
         };
         let agent = Arc::new(Agent::open(cfg.clone(), options).unwrap());
         let stop = CancellationToken::new();
@@ -60,6 +64,32 @@ impl Watching {
 
 fn registered(h: &Harness) -> usize {
     h.recorder.manifests(Register).len()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stream_posts_the_receipt_once_the_unit_is_moved() {
+    let h = Harness::new();
+    let cfg = h.config(&format!(
+        "    settle: 300ms\n    unit_idle: 600ms\n    poll_interval: 100ms\n    full_scan_interval: 60s\n    watch: poll\n{}",
+        h.backup_extra("move")
+    ));
+    write_at(&h.src.join("u__1/a.tif"), b"data", wall());
+    let inbox = Inbox::receipts();
+
+    let watching = Watching::start_with(&cfg, h.notifying(&inbox));
+    eventually("the receipt posted", Duration::from_secs(15), || {
+        !inbox.receipts_seen().is_empty()
+    })
+    .await;
+    watching.stop().await;
+
+    let receipts = inbox.receipts_seen();
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(
+        (receipts[0].original.action.as_str(), receipts[0].original.done),
+        ("move", true)
+    );
+    assert!(h.backup.join("u__1/a.tif").exists());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -142,9 +172,21 @@ async fn file_events_wake_a_stream_long_before_its_next_poll() {
     );
 
     let watching = Watching::start(&h, &cfg);
-    tokio::time::sleep(Duration::from_secs(1)).await; // the watcher is running
-    write_at(&h.src.join("u__1/a.tif"), b"data", wall());
-    eventually("the unit registered", Duration::from_secs(30), || registered(&h) == 1).await;
+    // The watcher starts in the background, and an event made before it is
+    // listening is lost. Keep making fresh ones until the file has gone up:
+    // with a 10-minute poll, only an event can get it there in time.
+    let file = h.src.join("u__1/a.tif");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut last_event: Option<Instant> = None;
+    while registered(&h) == 0 {
+        assert!(Instant::now() < deadline, "the unit did not register within 30s");
+        let uploaded = h.remote.join("u__1/a.tif").exists();
+        if !uploaded && last_event.is_none_or(|t| t.elapsed() > Duration::from_secs(3)) {
+            write_at(&file, b"data", wall());
+            last_event = Some(Instant::now());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     watching.stop().await;
 
     assert_eq!(data_files(&h.remote), tree(&[("u__1/a.tif", b"data")]));

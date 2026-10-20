@@ -305,7 +305,11 @@ fn start_watcher(engine: &Engine, shared: Arc<Shared>) -> Option<RecommendedWatc
             let Some(rel) = roots.iter().find_map(|r| path.strip_prefix(r).ok()) else {
                 continue;
             };
-            let rel = rel.to_string_lossy().replace('\\', "/");
+            let rel = rel
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/");
             match (!rel.is_empty()).then(|| layout.key_for(&rel)).flatten() {
                 Some(key) => {
                     hints.hinted.lock().unwrap_or_else(|p| p.into_inner()).insert(key);

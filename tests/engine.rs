@@ -7,7 +7,6 @@ use ferry::config::Level;
 use ferry::journal::Journal;
 use ferry::manifest::EventKind::{Failures, Finalize, Register};
 use ferry::runner::{Agent, AgentOptions};
-use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 #[tokio::test]
@@ -286,7 +285,7 @@ async fn files_already_in_the_store_are_adopted_not_uploaded_again() {
     age_tree(&h.src, hour_ago());
     write(&h.remote.join("u__1/a.tif"), b"alpha");
     write(&h.remote.join("u__1/b.tif"), b"different size");
-    let cfg = h.config("");
+    let cfg = h.config("    adopt: size\n");
 
     let report = h.pass(&cfg).await;
 
@@ -318,13 +317,54 @@ async fn a_hash_verified_destination_never_adopts_what_it_cannot_check() {
     let cfg = h.config_with(
         "[remote, {store: mirror, verify: sha256}]",
         "[{name: rec, exec: [unused]}]",
-        "",
+        "    adopt: size\n",
     );
 
     let report = h.pass(&cfg).await;
 
     assert_eq!(report.adopted, 0);
     assert_eq!(std::fs::read(h.mirror.join("u__1/a.tif")).unwrap(), b"alpha");
+}
+
+#[tokio::test]
+async fn by_default_an_object_already_there_is_uploaded_over() {
+    let h = Harness::new();
+    write(&h.src.join("u__1/a.tif"), b"alpha");
+    age_tree(&h.src, hour_ago());
+    write(&h.remote.join("u__1/a.tif"), b"ALPHA");
+    let cfg = h.config("");
+
+    let report = h.pass(&cfg).await;
+
+    assert_eq!((report.adopted, report.uploaded), (0, 1));
+    assert_eq!(std::fs::read(h.remote.join("u__1/a.tif")).unwrap(), b"alpha");
+}
+
+#[tokio::test]
+async fn hash_adoption_counts_only_what_reads_back_the_same() {
+    let h = Harness::new();
+    write(&h.src.join("u__1/a.tif"), b"alpha");
+    write(&h.src.join("u__1/b.tif"), b"bravo");
+    age_tree(&h.src, hour_ago());
+    write(&h.remote.join("u__1/a.tif"), b"alpha");
+    write(&h.remote.join("u__1/b.tif"), b"BRAVO");
+    let cfg = h.config(&format!("    adopt: sha256\n{}", h.backup_extra("move")));
+
+    let report = h.pass(&cfg).await;
+
+    assert_eq!((report.adopted, report.uploaded), (1, 1));
+    assert_eq!(std::fs::read(h.remote.join("u__1/b.tif")).unwrap(), b"bravo");
+    let registered = h.recorder.manifests(Register);
+    let verified: Vec<Option<String>> = registered[0]
+        .files
+        .iter()
+        .map(|f| f.copies[0].verified.clone())
+        .collect();
+    assert_eq!(verified, [Some("sha256".into()), Some("size".into())]);
+    assert!(
+        h.backup.join("u__1/a.tif").exists(),
+        "moved on the strength of the readback"
+    );
 }
 
 #[tokio::test]
@@ -672,17 +712,14 @@ async fn each_pass_digest_reaches_notifiers_as_one_alert() {
     let cfg = h.config("");
     write(&h.src.join("u__1/a.tif"), b"data");
     age_tree(&h.src, hour_ago());
-    let inbox = Arc::new(common::Inbox::default());
-    let options = AgentOptions {
-        notifiers: Some(vec![inbox.clone()]),
-        ..h.options(false)
-    };
-    let agent = Agent::open(cfg.clone(), options).unwrap();
+    let inbox = Inbox::alerts();
+    let agent = Agent::open(cfg.clone(), h.notifying(&inbox)).unwrap();
     let stop = CancellationToken::new();
     agent.run_once(&[], &stop).await.unwrap();
     agent.run_once(&[], &stop).await.unwrap();
 
-    let digests: Vec<_> = inbox.0.lock().unwrap().iter().filter_map(|e| e.alert.clone()).collect();
+    assert!(inbox.receipts_seen().is_empty(), "an alert notifier takes no receipts");
+    let digests = inbox.alerts_seen();
     assert_eq!(digests.len(), 2);
     assert_eq!(digests[0].level, Level::Info);
     assert_eq!(digests[0].pipeline.as_deref(), Some("inst"));
@@ -696,6 +733,128 @@ async fn each_pass_digest_reaches_notifiers_as_one_alert() {
         "{}",
         digests[1].title
     );
+}
+
+#[tokio::test]
+async fn a_delivered_unit_gets_one_receipt_saying_where_it_went() {
+    let h = Harness::new();
+    let cfg = h.config_with(
+        "[remote, {store: mirror, verify: sha256}]",
+        "[{name: rec, exec: [unused]}]",
+        &h.backup_extra("move"),
+    );
+    write(&h.src.join("plateA__1/img/a.tif"), b"alpha");
+    write(&h.src.join("plateA__1/b.tif"), b"bravo!");
+    age_tree(&h.src, hour_ago());
+    let inbox = Inbox::receipts();
+
+    h.pass_with(
+        &cfg,
+        AgentOptions {
+            dry_run: true,
+            ..h.notifying(&inbox)
+        },
+    )
+    .await;
+    assert!(inbox.events.lock().unwrap().is_empty(), "a dry run posts nothing");
+    h.pass_with(&cfg, h.notifying(&inbox)).await;
+    h.pass_with(&cfg, h.notifying(&inbox)).await;
+
+    assert!(inbox.alerts_seen().is_empty(), "a receipt notifier takes no digests");
+    let receipts = inbox.receipts_seen();
+    assert_eq!(receipts.len(), 1, "one per unit, however many passes");
+    let r = &receipts[0];
+    assert_eq!(
+        (r.unit.as_str(), r.generation, r.update, r.files, r.bytes),
+        ("plateA__1", 1, false, 2, 11)
+    );
+    let copies: Vec<(&str, &str)> = r
+        .destinations
+        .iter()
+        .map(|d| (d.name.as_str(), d.verified.as_str()))
+        .collect();
+    assert_eq!(copies, [("remote", "size"), ("mirror", "sha256")]);
+    assert_eq!(r.registrars, ["rec"]);
+    assert_eq!(
+        (r.original.action.as_str(), r.original.done, r.original.path.clone()),
+        ("move", true, Some(h.backup.join("plateA__1").display().to_string()))
+    );
+    let event = inbox.events.lock().unwrap()[0].clone();
+    assert_eq!(
+        (event.node.as_str(), event.pipeline.as_deref()),
+        ("test-node", Some("inst"))
+    );
+}
+
+#[tokio::test]
+async fn a_receipt_does_not_wait_out_the_grace_before_a_delete() {
+    let h = Harness::new();
+    let cfg = h.config("    finalize: {action: delete, after: 1h}\n");
+    write(&h.src.join("u__1/a.tif"), b"data");
+    age_tree(&h.src, hour_ago());
+    let inbox = Inbox::receipts();
+
+    h.pass_with(&cfg, h.notifying(&inbox)).await;
+    assert!(h.src.join("u__1/a.tif").exists());
+    let receipts = inbox.receipts_seen();
+    assert_eq!(receipts.len(), 1);
+    let original = &receipts[0].original;
+    assert_eq!((original.action.as_str(), original.done), ("delete", false));
+    let secs = |t: &str| chrono::DateTime::parse_from_rfc3339(t).unwrap().timestamp();
+    assert_eq!(
+        secs(original.at.as_deref().unwrap()) - secs(&receipts[0].delivered),
+        3600
+    );
+
+    h.clock.advance(3601.0);
+    h.pass_with(&cfg, h.notifying(&inbox)).await;
+    assert!(!h.src.join("u__1").exists());
+    assert_eq!(inbox.receipts_seen().len(), 1, "the deletion itself posts nothing more");
+}
+
+#[tokio::test]
+async fn a_receipt_waits_in_the_journal_while_chat_is_down() {
+    let h = Harness::new();
+    let cfg = h.config("");
+    write(&h.src.join("u__1/a.tif"), b"data");
+    age_tree(&h.src, hour_ago());
+    let inbox = Inbox::receipts();
+    *inbox.failing.lock().unwrap() = 1;
+
+    let report = h.pass_with(&cfg, h.notifying(&inbox)).await;
+    assert_eq!(report.delivery_failures, 1);
+    assert_eq!(
+        h.unit_state(&cfg, "u__1").as_deref(),
+        Some("finalized"),
+        "receipts hold nothing up"
+    );
+    h.pass_with(&cfg, h.notifying(&inbox)).await;
+    assert!(inbox.receipts_seen().is_empty(), "backing off");
+
+    h.clock.advance(31.0);
+    h.pass_with(&cfg, h.notifying(&inbox)).await;
+    assert_eq!(inbox.receipts_seen().len(), 1);
+}
+
+#[tokio::test]
+async fn files_that_arrive_after_a_receipt_bring_an_update() {
+    let h = Harness::new();
+    let cfg = h.config("");
+    write(&h.src.join("u__1/a.tif"), b"a");
+    age_tree(&h.src, hour_ago());
+    let inbox = Inbox::receipts();
+    h.pass_with(&cfg, h.notifying(&inbox)).await;
+
+    write(&h.src.join("u__1/b.tif"), b"bb");
+    h.clock.advance(10.0);
+    h.pass_with(&cfg, h.notifying(&inbox)).await;
+
+    let seen: Vec<(i64, bool, usize, i64)> = inbox
+        .receipts_seen()
+        .iter()
+        .map(|r| (r.generation, r.update, r.files, r.bytes))
+        .collect();
+    assert_eq!(seen, [(1, false, 1, 1), (2, true, 2, 3)]);
 }
 
 #[tokio::test]
@@ -753,4 +912,247 @@ async fn big_files_go_up_in_parts_to_every_destination() {
     assert_eq!(std::fs::read(h.mirror.join("u__1/big.raw")).unwrap(), body);
     let registered = h.recorder.manifests(Register);
     assert_eq!(registered[0].files[0].sha256.as_deref(), Some(sha256(&body).as_str()));
+}
+
+#[tokio::test]
+async fn a_copy_that_vanished_is_sent_again_before_the_source_goes() {
+    let h = Harness::new();
+    let cfg = h.config("    finalize: {action: delete, after: 1h}\n");
+    write(&h.src.join("u__1/a.tif"), b"data");
+    age_tree(&h.src, hour_ago());
+    h.pass(&cfg).await;
+    std::fs::remove_file(h.remote.join("u__1/a.tif")).unwrap();
+
+    h.clock.advance(3601.0);
+    let report = h.pass(&cfg).await;
+    assert!(h.src.join("u__1/a.tif").exists(), "kept while a copy is missing");
+    assert!(report.reopened[0].1.contains("is gone"), "{:?}", report.reopened);
+
+    h.pass(&cfg).await;
+    assert_eq!(data_files(&h.remote), tree(&[("u__1/a.tif", b"data")]));
+    h.clock.advance(3601.0);
+    h.pass(&cfg).await;
+    assert!(!h.src.join("u__1").exists());
+}
+
+#[tokio::test]
+async fn an_overwritten_copy_does_not_vouch_for_a_delete() {
+    let h = Harness::new();
+    let cfg = h.config("    finalize: {action: delete, after: 1h}\n");
+    write(&h.src.join("u__1/a.tif"), b"data");
+    age_tree(&h.src, hour_ago());
+    h.pass(&cfg).await;
+    // Same size, other bytes: only its ETag tells.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    std::fs::write(h.remote.join("u__1/a.tif"), b"DATA").unwrap();
+
+    h.clock.advance(3601.0);
+    let report = h.pass(&cfg).await;
+    assert!(h.src.join("u__1/a.tif").exists());
+    assert!(
+        report.reopened[0].1.contains("was overwritten"),
+        "{:?}",
+        report.reopened
+    );
+}
+
+#[tokio::test]
+async fn a_rewrite_that_keeps_size_and_time_is_caught_before_a_delete() {
+    let h = Harness::new();
+    let cfg = h.config("    finalize: {action: delete, after: 1h}\n");
+    let path = write(&h.src.join("u__1/a.tif"), b"data");
+    age_tree(&h.src, hour_ago());
+    h.pass(&cfg).await;
+    let mtime = filetime::FileTime::from_last_modification_time(&std::fs::metadata(&path).unwrap());
+    std::fs::write(&path, b"DATA").unwrap();
+    filetime::set_file_mtime(&path, mtime).unwrap();
+
+    h.clock.advance(3601.0);
+    let report = h.pass(&cfg).await;
+    assert_eq!(std::fs::read(&path).unwrap(), b"DATA", "put back, not deleted");
+    assert!(
+        report.reopened[0].1.contains("holds other bytes"),
+        "{:?}",
+        report.reopened
+    );
+    assert!(!h.src.join("u__1/a.tif.ferry-finalizing").exists());
+}
+
+#[tokio::test]
+async fn a_finalize_interrupted_after_setting_a_file_aside_resumes() {
+    let h = Harness::new();
+    let cfg = h.config(&format!(
+        "    finalize: {{action: move, backup_root: '{}', after: 1h}}\n",
+        h.backup.display()
+    ));
+    let path = write(&h.src.join("u__1/a.tif"), b"data");
+    age_tree(&h.src, hour_ago());
+    h.pass(&cfg).await;
+    // As if ferry stopped right after the rename.
+    std::fs::rename(&path, h.src.join("u__1/a.tif.ferry-finalizing")).unwrap();
+
+    h.clock.advance(3601.0);
+    let report = h.pass(&cfg).await;
+    assert_eq!(report.finalized, ["u__1"]);
+    assert_eq!(files_under(&h.backup), tree(&[("u__1/a.tif", b"data")]));
+    assert!(!h.src.join("u__1").exists());
+}
+
+#[tokio::test]
+async fn a_move_whose_source_vanished_needs_a_backup_that_matches() {
+    let h = Harness::new();
+    let cfg = h.config(&format!(
+        "    finalize: {{action: move, backup_root: '{}', after: 1h}}\n",
+        h.backup.display()
+    ));
+    let path = write(&h.src.join("u__1/a.tif"), b"data");
+    age_tree(&h.src, hour_ago());
+    h.pass(&cfg).await;
+    std::fs::remove_file(&path).unwrap();
+
+    h.clock.advance(3601.0);
+    let report = h.pass(&cfg).await;
+    assert_eq!(report.finalize_failures, 1);
+    assert_eq!(h.unit_state(&cfg, "u__1").as_deref(), Some("registered"));
+
+    write(&h.backup.join("u__1/a.tif"), b"DATA");
+    h.clock.advance(3601.0);
+    let report = h.pass(&cfg).await;
+    assert_eq!(report.finalize_failures, 1, "a backup with other bytes does not count");
+
+    std::fs::write(h.backup.join("u__1/a.tif"), b"data").unwrap();
+    h.clock.advance(3601.0);
+    let report = h.pass(&cfg).await;
+    assert_eq!(report.finalized, ["u__1"]);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_unit_with_a_folder_it_cannot_read_waits_for_it() {
+    let h = Harness::new();
+    let cfg = h.config("");
+    write(&h.src.join("u__1/a.tif"), b"a");
+    write(&h.src.join("u__1/later/b.tif"), b"b");
+    age_tree(&h.src, hour_ago());
+
+    let locked = lock_out(&h.src.join("u__1/later"));
+    let report = h.pass(&cfg).await;
+    let_in(&h.src.join("u__1/later"));
+    if !locked {
+        return;
+    }
+    assert!(report.registered.is_empty());
+    assert!(
+        report.waiting["u__1"].contains("cannot read all of it"),
+        "{:?}",
+        report.waiting
+    );
+    assert!(data_files(&h.remote).is_empty());
+
+    h.pass(&cfg).await;
+    let registered = h.recorder.manifests(Register);
+    assert_eq!(
+        registered[0].files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(),
+        ["a.tif", "later/b.tif"]
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_complete_unit_that_turns_unreadable_does_not_register() {
+    let h = Harness::new();
+    let cfg = h.config("");
+    write(&h.src.join("u__1/a.tif"), b"a");
+    std::fs::create_dir_all(h.src.join("u__1/later")).unwrap();
+    age_tree(&h.src, hour_ago());
+    block(&h.remote, "u__1");
+    h.pass(&cfg).await;
+    assert_eq!(h.unit_state(&cfg, "u__1").as_deref(), Some("complete"));
+
+    // A file lands where the next scan cannot look; a.tif stays as it was.
+    write(&h.src.join("u__1/later/b.tif"), b"b");
+    unblock(&h.remote, "u__1");
+    h.clock.advance(31.0);
+    let locked = lock_out(&h.src.join("u__1/later"));
+    let report = h.pass(&cfg).await;
+    let_in(&h.src.join("u__1/later"));
+    if !locked {
+        return;
+    }
+    assert!(report.registered.is_empty(), "never with a partial file list");
+
+    h.pass(&cfg).await;
+    let registered = h.recorder.manifests(Register);
+    assert_eq!(
+        registered[0].files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(),
+        ["a.tif", "later/b.tif"]
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_registered_unit_that_turns_unreadable_is_not_finalized() {
+    let h = Harness::new();
+    let cfg = h.config("    finalize: {action: delete, after: 1h}\n");
+    write(&h.src.join("u__1/a.tif"), b"a");
+    write(&h.src.join("u__1/later/b.tif"), b"b");
+    age_tree(&h.src, hour_ago());
+    h.pass(&cfg).await;
+    assert_eq!(h.unit_state(&cfg, "u__1").as_deref(), Some("registered"));
+
+    h.clock.advance(3601.0);
+    let locked = lock_out(&h.src.join("u__1/later"));
+    let report = h.pass(&cfg).await;
+    let_in(&h.src.join("u__1/later"));
+    if !locked {
+        return;
+    }
+    assert!(report.finalized.is_empty());
+    assert!(
+        h.src.join("u__1/a.tif").exists(),
+        "nothing goes while part of the unit is unread"
+    );
+
+    h.pass(&cfg).await;
+    assert!(!h.src.join("u__1").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_root_that_cannot_be_listed_makes_nothing_gone() {
+    let h = Harness::new();
+    let cfg = h.config("    unit_idle: 2h\n");
+    write(&h.src.join("u__1/a.tif"), b"a");
+    age_tree(&h.src, hour_ago());
+    h.pass(&cfg).await;
+
+    let locked = lock_out(&h.src);
+    let report = h.pass(&cfg).await;
+    let_in(&h.src);
+    if !locked {
+        return;
+    }
+    assert!(report.reopened.is_empty());
+    let journal = Journal::open(&cfg.journal_path()).unwrap();
+    let unit = journal.find_unit("inst", "u__1").unwrap().unwrap();
+    assert!(unit.present);
+    let files = journal.files(unit.id).unwrap();
+    assert!(files.iter().all(|f| f.present && f.state == "pending"), "{files:?}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn names_with_backslashes_keep_keys_of_their_own() {
+    let h = Harness::new();
+    let cfg = h.config("");
+    write(&h.src.join("u__1/a\\b.tif"), b"one name");
+    write(&h.src.join("u__1/a/b.tif"), b"two names");
+    age_tree(&h.src, hour_ago());
+
+    h.pass(&cfg).await;
+
+    assert_eq!(
+        data_files(&h.remote),
+        tree(&[("u__1/a%5Cb.tif", b"one name"), ("u__1/a/b.tif", b"two names")])
+    );
 }

@@ -34,6 +34,10 @@ pub struct UnitObs {
     /// ferry does not upload and the directories themselves included, since a
     /// directory's mtime moves whenever an entry is added, removed or renamed.
     pub newest_ns: i64,
+    /// What could not be read in the unit. While anything is unread, a file
+    /// ferry did not see may still be there: none counts as gone, and the
+    /// unit neither completes, registers nor finalizes.
+    pub errors: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -42,7 +46,12 @@ pub struct Scan {
     /// Unit keys this scan looked at in full (`None`: the whole tree), so the
     /// journal can tell "deleted" from "not looked at".
     pub scope: Option<BTreeSet<String>>,
-    pub errors: usize,
+    /// What could not be read outside any unit. A unit there may exist
+    /// unseen, so no unit counts as gone.
+    pub errors: Vec<String>,
+    /// The errors could hide any unit's files (a regex layout gathers files
+    /// from anywhere): every unit counts as not fully read.
+    pub unattributed: bool,
 }
 
 pub struct Layout {
@@ -66,6 +75,28 @@ struct Entry {
 enum Kind {
     Dir,
     File,
+    /// A symbolic link (or junction), never followed: its target may be
+    /// anywhere, and ferry ships only what is under the root.
+    Link,
+}
+
+/// Appended to a file's name while it is being finalized: it is set aside by
+/// a rename first, so a writer that comes back makes a new file instead of
+/// changing the bytes being deleted or moved. Scans never see these.
+pub const HELD_SUFFIX: &str = ".ferry-finalizing";
+
+/// Where `path` waits while it is finalized.
+pub fn held_path(path: &Path) -> PathBuf {
+    let mut held = path.as_os_str().to_owned();
+    held.push(HELD_SUFFIX);
+    PathBuf::from(held)
+}
+
+fn link_error(path: &Path) -> String {
+    format!(
+        "{}: symbolic links are not followed; exclude it, or replace it with what it points to",
+        path.display()
+    )
 }
 
 impl Layout {
@@ -119,39 +150,54 @@ impl Layout {
             .then(|| head.join("/"))
     }
 
-    fn entries(path: &Path, errors: &mut usize) -> Vec<Entry> {
-        let Ok(read) = fs::read_dir(path) else {
-            *errors += 1;
-            return Vec::new();
+    /// A directory's entries; what cannot be read is described in `errors`.
+    fn entries(path: &Path, errors: &mut Vec<String>) -> Vec<Entry> {
+        let read = match fs::read_dir(path) {
+            Ok(read) => read,
+            Err(e) => {
+                errors.push(format!("cannot list {}: {e}", path.display()));
+                return Vec::new();
+            }
         };
         let mut out = Vec::new();
         for entry in read {
-            let Ok(entry) = entry else {
-                *errors += 1;
-                continue;
-            };
-            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
-                *errors += 1; // not valid Unicode: skipped rather than mangled
-                continue;
-            };
-            let Ok(file_type) = entry.file_type() else {
-                *errors += 1;
-                continue;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) => {
+                    errors.push(format!("cannot list {}: {e}", path.display()));
+                    continue;
+                }
             };
             let path = entry.path();
-            let meta = if file_type.is_symlink() {
-                // Follow links to files; never links to directories (loops).
-                match fs::metadata(&path) {
-                    Ok(meta) if meta.is_file() => meta,
-                    _ => continue,
+            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                errors.push(format!("{}: the name is not valid Unicode", path.display()));
+                continue;
+            };
+            if name.ends_with(HELD_SUFFIX) {
+                continue;
+            }
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(e) => {
+                    errors.push(format!("cannot read {}: {e}", path.display()));
+                    continue;
                 }
-            } else {
-                match entry.metadata() {
-                    Ok(meta) => meta,
-                    Err(_) => {
-                        *errors += 1;
-                        continue;
-                    }
+            };
+            if file_type.is_symlink() {
+                out.push(Entry {
+                    name,
+                    path,
+                    kind: Kind::Link,
+                    size: 0,
+                    mtime_ns: 0,
+                });
+                continue;
+            }
+            let meta = match entry.metadata() {
+                Ok(meta) => meta,
+                Err(e) => {
+                    errors.push(format!("cannot read {}: {e}", path.display()));
+                    continue;
                 }
             };
             let kind = if meta.is_dir() {
@@ -177,10 +223,10 @@ impl Layout {
         if !self.by_dirs() {
             return Vec::new();
         }
-        self.unit_dirs(&mut 0)
+        self.unit_dirs(&mut Vec::new())
     }
 
-    fn unit_dirs(&self, errors: &mut usize) -> Vec<String> {
+    fn unit_dirs(&self, errors: &mut Vec<String>) -> Vec<String> {
         let mut frontier = vec![(String::new(), self.root.clone())];
         for level in &self.levels {
             let mut deeper = Vec::new();
@@ -191,8 +237,13 @@ impl Layout {
                     } else {
                         format!("{prefix}/{}", entry.name)
                     };
-                    if entry.kind == Kind::Dir && level.is_match(&entry.name) && !self.exclude.is_match(&rel) {
-                        deeper.push((rel, entry.path));
+                    if !level.is_match(&entry.name) || self.exclude.is_match(&rel) {
+                        continue;
+                    }
+                    match entry.kind {
+                        Kind::Dir => deeper.push((rel, entry.path)),
+                        Kind::Link => errors.push(link_error(&entry.path)),
+                        Kind::File => {}
                     }
                 }
             }
@@ -205,12 +256,13 @@ impl Layout {
 
     /// Observe the whole tree, or just the units in `keys` (directory units).
     pub fn scan(&self, keys: Option<&[String]>) -> Scan {
-        let mut errors = 0;
+        let mut errors = Vec::new();
         if self.regex.is_some() {
             let units = self.scan_regex(&mut errors);
             return Scan {
                 units,
                 scope: None,
+                unattributed: !errors.is_empty(),
                 errors,
             };
         }
@@ -220,7 +272,7 @@ impl Layout {
                     .unit_dirs(&mut errors)
                     .into_iter()
                     .map(|key| {
-                        let obs = self.scan_dir(&key, &mut errors);
+                        let obs = self.scan_dir(&key);
                         (key, obs)
                     })
                     .collect();
@@ -228,25 +280,55 @@ impl Layout {
                     units,
                     scope: None,
                     errors,
+                    unattributed: false,
                 }
             }
             Some(keys) => {
                 let scope: BTreeSet<String> = keys.iter().cloned().collect();
-                let units = scope
-                    .iter()
-                    .filter(|key| self.root.join(key.as_str()).is_dir())
-                    .map(|key| (key.clone(), self.scan_dir(key, &mut errors)))
-                    .collect();
+                let mut units = BTreeMap::new();
+                for key in &scope {
+                    let top = self.root.join(key);
+                    match fs::symlink_metadata(&top) {
+                        Ok(meta) if meta.is_dir() => {
+                            units.insert(key.clone(), self.scan_dir(key));
+                        }
+                        Ok(meta) if meta.file_type().is_symlink() => {
+                            units.insert(
+                                key.clone(),
+                                UnitObs {
+                                    key: key.clone(),
+                                    errors: vec![link_error(&top)],
+                                    ..Default::default()
+                                },
+                            );
+                        }
+                        // Gone, or no longer a directory.
+                        Ok(_) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        // Cannot tell: its files stay as last seen.
+                        Err(e) => {
+                            units.insert(
+                                key.clone(),
+                                UnitObs {
+                                    key: key.clone(),
+                                    errors: vec![format!("cannot read {}: {e}", top.display())],
+                                    ..Default::default()
+                                },
+                            );
+                        }
+                    }
+                }
                 Scan {
                     units,
                     scope: Some(scope),
                     errors,
+                    unattributed: false,
                 }
             }
         }
     }
 
-    fn scan_dir(&self, key: &str, errors: &mut usize) -> UnitObs {
+    fn scan_dir(&self, key: &str) -> UnitObs {
         let mut obs = UnitObs {
             key: key.to_string(),
             ..Default::default()
@@ -254,11 +336,11 @@ impl Layout {
         let top = self.root.join(key);
         match fs::metadata(&top) {
             Ok(meta) => obs.newest_ns = mtime_ns(&meta),
-            Err(_) => *errors += 1,
+            Err(e) => obs.errors.push(format!("cannot read {}: {e}", top.display())),
         }
         let mut stack = vec![(top, String::new())];
         while let Some((path, prefix)) = stack.pop() {
-            for entry in Self::entries(&path, errors) {
+            for entry in Self::entries(&path, &mut obs.errors) {
                 let within = if prefix.is_empty() {
                     entry.name.clone()
                 } else {
@@ -268,10 +350,17 @@ impl Layout {
                 if self.exclude.is_match(&rel) {
                     continue;
                 }
-                obs.newest_ns = obs.newest_ns.max(entry.mtime_ns);
-                if entry.kind == Kind::Dir {
-                    stack.push((entry.path, within));
-                    continue;
+                match entry.kind {
+                    Kind::Link => {
+                        obs.errors.push(link_error(&entry.path));
+                        continue;
+                    }
+                    Kind::Dir => {
+                        obs.newest_ns = obs.newest_ns.max(entry.mtime_ns);
+                        stack.push((entry.path, within));
+                        continue;
+                    }
+                    Kind::File => obs.newest_ns = obs.newest_ns.max(entry.mtime_ns),
                 }
                 if self.marker.as_ref().is_some_and(|m| m.is_match(&within)) {
                     obs.marker = true;
@@ -292,7 +381,7 @@ impl Layout {
         obs
     }
 
-    fn scan_regex(&self, errors: &mut usize) -> BTreeMap<String, UnitObs> {
+    fn scan_regex(&self, errors: &mut Vec<String>) -> BTreeMap<String, UnitObs> {
         let re = self.regex.as_ref().expect("regex layout");
         let mut units: BTreeMap<String, UnitObs> = BTreeMap::new();
         let mut stack = vec![(self.root.clone(), String::new())];
@@ -306,9 +395,16 @@ impl Layout {
                 if self.exclude.is_match(&rel) {
                     continue;
                 }
-                if entry.kind == Kind::Dir {
-                    stack.push((entry.path, rel));
-                    continue;
+                match entry.kind {
+                    Kind::Link => {
+                        errors.push(link_error(&entry.path));
+                        continue;
+                    }
+                    Kind::Dir => {
+                        stack.push((entry.path, rel));
+                        continue;
+                    }
+                    Kind::File => {}
                 }
                 let Some(key) = re.captures(&rel).and_then(|c| regex_key(&c)) else {
                     continue;
@@ -341,7 +437,6 @@ impl Layout {
 fn regex_key(caps: &regex::Captures) -> Option<String> {
     let raw = caps.name("unit")?.as_str();
     let key = raw
-        .replace('\\', "/")
         .split('/')
         .filter(|p| !p.is_empty() && *p != "." && *p != "..")
         .collect::<Vec<_>>()
@@ -509,5 +604,110 @@ mod tests {
         write(&root.join("b__2/deep/x.tif"), b"");
         write(&root.join("plain/x.tif"), b"");
         assert_eq!(layout(root, "    unit: {dirs: '*__*'}\n").unit_keys(), ["a__1", "b__2"]);
+    }
+
+    /// Make `path` unreadable; `false` if this process reads it anyway (root).
+    #[cfg(unix)]
+    fn lock_out(path: &Path) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o000)).unwrap();
+        fs::read_dir(path).is_err()
+    }
+
+    #[cfg(unix)]
+    fn let_in(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn what_cannot_be_read_is_reported_where_it_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        write(&root.join("u/a.tif"), b"a");
+        write(&root.join("u/sub/b.tif"), b"b");
+        write(&root.join("v/c.tif"), b"c");
+        let lay = layout(&root, "");
+
+        let locked = lock_out(&root.join("u/sub"));
+        let scan = lay.scan(None);
+        let_in(&root.join("u/sub"));
+        if !locked {
+            return;
+        }
+        assert!(scan.errors.is_empty());
+        assert_eq!(scan.units["u"].files.keys().collect::<Vec<_>>(), ["u/a.tif"]);
+        assert!(
+            scan.units["u"].errors[0].contains("cannot list"),
+            "{:?}",
+            scan.units["u"].errors
+        );
+        assert!(scan.units["v"].errors.is_empty());
+
+        lock_out(&root);
+        let full = lay.scan(None);
+        let scoped = lay.scan(Some(&["u".into()]));
+        let_in(&root);
+        assert!(full.units.is_empty());
+        assert!(full.errors[0].contains("cannot list"), "{:?}", full.errors);
+        assert!(
+            !scoped.units["u"].errors.is_empty(),
+            "a unit that cannot be looked at is not gone"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_are_reported_not_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        write(&dir.path().join("outside.tif"), b"not ours");
+        write(&root.join("u/a.tif"), b"a");
+        std::os::unix::fs::symlink(dir.path().join("outside.tif"), root.join("u/link.tif")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("outside.tif"), root.join("v")).unwrap();
+
+        let scan = layout(&root, "").scan(None);
+        assert_eq!(scan.units["u"].files.keys().collect::<Vec<_>>(), ["u/a.tif"]);
+        assert!(scan.units["u"].errors[0].contains("symbolic links are not followed"));
+        assert!(
+            scan.errors[0].contains("symbolic links are not followed"),
+            "a link at unit level"
+        );
+
+        let excluded = layout(&root, "    exclude: ['u/link.tif', 'v']\n").scan(None);
+        assert!(excluded.units["u"].errors.is_empty() && excluded.errors.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_name_that_is_not_unicode_is_an_error() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(&root.join("u/a.tif"), b"a");
+        write(&root.join("u").join(std::ffi::OsStr::from_bytes(b"bad\xff.tif")), b"b");
+
+        let scan = layout(root, "").scan(None);
+        assert!(scan.units["u"].errors[0].contains("not valid Unicode"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unread_directory_could_hold_any_regex_units_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        write(&root.join("RUN1_a.csv"), b"");
+        write(&root.join("locked/RUN1_b.csv"), b"");
+        let lay = layout(&root, "    unit: {regex: '(?:^|/)(?P<unit>RUN\\d+)_'}\n");
+
+        let locked = lock_out(&root.join("locked"));
+        let scan = lay.scan(None);
+        let_in(&root.join("locked"));
+        if !locked {
+            return;
+        }
+        assert!(scan.unattributed);
+        assert_eq!(scan.units["RUN1"].files.len(), 1);
     }
 }

@@ -15,7 +15,7 @@ use ferry::config::Config;
 use ferry::engine::PassReport;
 use ferry::hooks::{Notifier, Registrar};
 use ferry::journal::Journal;
-use ferry::manifest::{Event, EventKind, Manifest, TransferEvent};
+use ferry::manifest::{Alert, Event, EventKind, Manifest, Receipt, TransferEvent};
 use ferry::runner::{Agent, AgentOptions};
 use ferry::util::Clock;
 use filetime::FileTime;
@@ -115,18 +115,75 @@ impl Recorder {
     }
 }
 
-/// Collects the alerts notifiers would be sent.
-#[derive(Default)]
-pub struct Inbox(pub Mutex<Vec<Event>>);
+/// Collects what a notifier taking `kinds` would be sent. Its first `failing`
+/// deliveries fail, like a chat service that is down.
+pub struct Inbox {
+    pub name: String,
+    pub kinds: Vec<EventKind>,
+    pub events: Mutex<Vec<Event>>,
+    pub failing: Mutex<usize>,
+}
+
+impl Inbox {
+    pub fn alerts() -> Arc<Self> {
+        Self::taking("alerts", &[EventKind::Alert])
+    }
+
+    pub fn receipts() -> Arc<Self> {
+        Self::taking("arrivals", &[EventKind::Receipt])
+    }
+
+    fn taking(name: &str, kinds: &[EventKind]) -> Arc<Self> {
+        Arc::new(Self {
+            name: name.into(),
+            kinds: kinds.to_vec(),
+            events: Mutex::new(Vec::new()),
+            failing: Mutex::new(0),
+        })
+    }
+
+    pub fn alerts_seen(&self) -> Vec<Alert> {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e.alert.clone())
+            .collect()
+    }
+
+    pub fn receipts_seen(&self) -> Vec<Receipt> {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e.receipt.clone())
+            .collect()
+    }
+}
 
 #[async_trait]
 impl Notifier for Inbox {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
     fn min_level(&self) -> ferry::config::Level {
         ferry::config::Level::Info
     }
 
+    fn wants(&self, kind: EventKind) -> bool {
+        self.kinds.contains(&kind)
+    }
+
     async fn notify(&self, event: &Event) -> anyhow::Result<()> {
-        self.0.lock().unwrap().push(event.clone());
+        {
+            let mut failing = self.failing.lock().unwrap();
+            if *failing > 0 {
+                *failing -= 1;
+                anyhow::bail!("chat is down");
+            }
+        }
+        self.events.lock().unwrap().push(event.clone());
         Ok(())
     }
 }
@@ -216,6 +273,14 @@ impl Harness {
         }
     }
 
+    /// [`Harness::options`], with `inbox` in place of the configured notifiers.
+    pub fn notifying(&self, inbox: &Arc<Inbox>) -> AgentOptions {
+        AgentOptions {
+            notifiers: Some(vec![inbox.clone()]),
+            ..self.options(false)
+        }
+    }
+
     pub fn agent(&self, cfg: &Config) -> Agent {
         Agent::open(cfg.clone(), self.options(false)).unwrap()
     }
@@ -267,6 +332,21 @@ pub fn write_at(path: &Path, data: &[u8], mtime: f64) -> PathBuf {
 /// Write `path`, long settled.
 pub fn write(path: &Path, data: &[u8]) -> PathBuf {
     write_at(path, data, hour_ago())
+}
+
+/// Make the directory `path` unreadable; `false` if this process reads it
+/// anyway (as root does), so the caller can skip.
+#[cfg(unix)]
+pub fn lock_out(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000)).unwrap();
+    std::fs::read_dir(path).is_err()
+}
+
+#[cfg(unix)]
+pub fn let_in(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
 /// Backdate every file and directory under (and including) `top`.

@@ -261,6 +261,42 @@ impl Verify {
     }
 }
 
+/// Whether an object already at a destination (after a lost journal, or a
+/// migration from another uploader) counts as a copy instead of being
+/// uploaded again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Adopt {
+    /// Upload everything.
+    #[default]
+    Off,
+    /// An object with the same key and size counts. Any object of that size
+    /// would pass, so only where source files are kept.
+    Size,
+    /// The object is read back and must hash like the local file.
+    Sha256,
+}
+
+/// `off`, `size` or `sha256`; `false` and `true` mean `off` and `size`.
+fn de_adopt<'de, D: Deserializer<'de>>(d: D) -> Result<Adopt, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Spec {
+        Flag(bool),
+        Name(String),
+    }
+    match Spec::deserialize(d)? {
+        Spec::Flag(false) => Ok(Adopt::Off),
+        Spec::Flag(true) => Ok(Adopt::Size),
+        Spec::Name(name) => match name.as_str() {
+            "off" => Ok(Adopt::Off),
+            "size" => Ok(Adopt::Size),
+            "sha256" => Ok(Adopt::Sha256),
+            other => Err(de::Error::custom(format!("{other:?} is not off, size or sha256"))),
+        },
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Level {
@@ -336,6 +372,80 @@ pub struct StoreConfig {
 impl StoreConfig {
     pub fn is_s3(&self) -> bool {
         self.url.starts_with("s3://")
+    }
+
+    /// Where objects under `prefix` in this store live.
+    fn namespace(&self, prefix: &str) -> Namespace {
+        let extra = prefix_parts(prefix);
+        if self.is_s3() {
+            let rest = &self.url["s3://".len()..];
+            let (bucket, base) = rest.split_once('/').unwrap_or((rest, ""));
+            let mut path = prefix_parts(base);
+            path.extend(extra);
+            Namespace::S3 {
+                bucket: bucket.to_string(),
+                endpoint: self
+                    .endpoint
+                    .as_deref()
+                    .map(|e| e.trim_end_matches('/').to_ascii_lowercase()),
+                path,
+            }
+        } else {
+            let mut dir = PathBuf::from(&self.url);
+            dir.extend(extra);
+            Namespace::Local(dir)
+        }
+    }
+}
+
+fn prefix_parts(prefix: &str) -> Vec<String> {
+    prefix
+        .split(['/', '\\'])
+        .filter(|p| !p.is_empty() && *p != ".")
+        .map(str::to_string)
+        .collect()
+}
+
+/// A place objects are written: a bucket (at an endpoint) and a key path in
+/// it, or a local directory.
+#[derive(Debug, Clone, PartialEq)]
+enum Namespace {
+    S3 {
+        bucket: String,
+        endpoint: Option<String>,
+        path: Vec<String>,
+    },
+    Local(PathBuf),
+}
+
+impl Namespace {
+    /// One holds the other, so objects could collide.
+    fn overlaps(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::S3 { bucket, endpoint, path },
+                Self::S3 {
+                    bucket: b,
+                    endpoint: e,
+                    path: p,
+                },
+            ) => bucket == b && endpoint == e && (path.starts_with(p) || p.starts_with(path)),
+            (Self::Local(a), Self::Local(b)) => inside(a, b) || inside(b, a),
+            _ => false,
+        }
+    }
+
+    fn identity(&self) -> String {
+        match self {
+            Self::S3 { bucket, endpoint, path } => {
+                let at = format!("s3://{bucket}/{}", path.join("/"));
+                match endpoint {
+                    Some(endpoint) => format!("{at} via {endpoint}"),
+                    None => at,
+                }
+            }
+            Self::Local(dir) => dir.display().to_string(),
+        }
     }
 }
 
@@ -515,14 +625,16 @@ impl HookConfig {
         self.exec
             .as_ref()
             .and_then(|argv| argv.first())
-            .map(|program| {
-                Path::new(program)
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| program.clone())
-            })
+            .map(|program| program_name(program))
             .unwrap_or_else(|| "hook".into())
     }
+}
+
+fn program_name(program: &str) -> String {
+    Path::new(program)
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| program.to_string())
 }
 
 impl FromStr for HookConfig {
@@ -564,20 +676,64 @@ impl Default for ManifestHook {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NotifierEvent {
+    /// Recurring failures, units stuck open, and (at `info`) each pass's digest.
+    Alert,
+    /// One per unit, once every destination holds it (see `docs/hooks.md`).
+    Receipt,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WebhookFormat {
+    /// `{"text": ...}`, which Slack incoming webhooks accept (as do Mattermost,
+    /// Rocket.Chat, Google Chat, and Discord's `/slack` webhook URLs).
+    #[default]
+    Text,
+    /// The event JSON itself, as an exec hook gets it.
+    Event,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NotifierConfig {
-    /// POST alerts as Slack-compatible `{"text": ...}` JSON to this URL.
+    /// Names the notifier in the journal, where its receipts wait until it
+    /// takes them. Defaults to `webhook`, or the `exec` program's name.
+    pub name: Option<String>,
+    /// POST each event to this URL, as `format` says.
     pub webhook: Option<String>,
-    /// Or run this command per alert, with the alert event JSON on stdin.
+    /// Or run this command per event, with the event JSON on stdin.
     pub exec: Option<Vec<String>>,
+    #[serde(default = "alerts_only")]
+    pub events: Vec<NotifierEvent>,
+    /// The least severe alert it takes.
     #[serde(default)]
     pub min_level: Level,
+    /// How a `webhook` posts: `text` (the default) or `event`.
+    pub format: Option<WebhookFormat>,
     pub cwd: Option<PathBuf>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     #[serde(default = "one_m", deserialize_with = "de_duration")]
     pub timeout: Duration,
+}
+
+fn alerts_only() -> Vec<NotifierEvent> {
+    vec![NotifierEvent::Alert]
+}
+
+impl NotifierConfig {
+    pub fn key(&self) -> String {
+        if let Some(name) = &self.name {
+            return name.clone();
+        }
+        match self.exec.as_ref().and_then(|argv| argv.first()) {
+            Some(program) => program_name(program),
+            None => "webhook".into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -622,8 +778,8 @@ pub struct PipelineConfig {
     pub watch: Watch,
     #[serde(default)]
     pub probe_exclusive: bool,
-    #[serde(default = "yes")]
-    pub adopt: bool,
+    #[serde(default, deserialize_with = "de_adopt")]
+    pub adopt: Adopt,
     #[serde(default)]
     pub finalize: FinalizeConfig,
     #[serde(default)]
@@ -937,12 +1093,25 @@ impl Config {
                 }
             }
         }
+        let mut receivers = BTreeSet::new();
         for (i, notifier) in self.notifiers.iter().enumerate() {
             if notifier.webhook.is_some() == notifier.exec.is_some() {
                 bail!("notifiers[{i}]: set exactly one of `webhook` or `exec`");
             }
             if notifier.exec.as_ref().is_some_and(Vec::is_empty) {
                 bail!("notifiers[{i}]: exec needs a command");
+            }
+            if notifier.events.is_empty() {
+                bail!("notifiers[{i}]: events is empty; list `alert`, `receipt` or both");
+            }
+            if notifier.format.is_some() && notifier.webhook.is_none() {
+                bail!("notifiers[{i}]: `format` applies to webhooks; an exec hook always gets the event JSON");
+            }
+            if notifier.events.contains(&NotifierEvent::Receipt) && !receivers.insert(notifier.key()) {
+                bail!(
+                    "notifiers that take receipts need distinct names ({} repeats); add `name:`",
+                    notifier.key()
+                );
             }
         }
         if let Some(ship) = &self.logs.ship {
@@ -960,7 +1129,7 @@ impl Config {
                 }
             }
         }
-        Ok(())
+        self.validate_places()
     }
 
     fn validate_pipeline(&self, p: &PipelineConfig, at: &dyn Fn(&str) -> String) -> Result<()> {
@@ -1053,6 +1222,16 @@ impl Config {
         if inside(&self.state_dir, &p.root) {
             bail!("{}", at("state_dir must live outside the root"));
         }
+        if p.adopt == Adopt::Size && p.finalize.action != Action::Keep {
+            bail!(
+                "{}",
+                at(&format!(
+                    "adopt: size trusts any object of the right size, so source files cannot be {}d on its \
+                     word; use adopt: sha256 (reads each object back) or off",
+                    p.finalize.action.as_str()
+                ))
+            );
+        }
         let mut hook_keys = BTreeSet::new();
         for hook in &p.registrars {
             let key = hook.key();
@@ -1091,6 +1270,64 @@ impl Config {
 
     pub fn journal_path(&self) -> PathBuf {
         self.state_dir.join("journal.sqlite3")
+    }
+
+    /// Where a destination's objects live (bucket, endpoint and key prefix, or
+    /// directory). The journal records it: copies made at one place do not
+    /// count at another.
+    pub fn destination_identity(&self, p: &PipelineConfig, d: &DestinationConfig) -> String {
+        self.stores[&d.store].namespace(&p.prefix_for(d)).identity()
+    }
+
+    /// No two destinations (or log shipping) may write where the other does,
+    /// and nothing ferry writes locally may sit in a watched root.
+    fn validate_places(&self) -> Result<()> {
+        let mut places: Vec<(String, Namespace)> = Vec::new();
+        for p in &self.pipelines {
+            for d in &p.destinations {
+                let place = self.stores[&d.store].namespace(&p.prefix_for(d));
+                places.push((format!("pipeline {} destination {}", p.name, d.key()), place));
+            }
+        }
+        if let Some(ship) = &self.logs.ship {
+            places.push(("logs.ship".into(), self.stores[&ship.store].namespace(&ship.prefix)));
+        }
+        for (i, (a, x)) in places.iter().enumerate() {
+            for (b, y) in &places[i + 1..] {
+                if x.overlaps(y) {
+                    bail!(
+                        "{a} and {b} write to overlapping places ({} and {}); give each its own prefix",
+                        x.identity(),
+                        y.identity()
+                    );
+                }
+            }
+        }
+        for p in &self.pipelines {
+            let mut local: Vec<(String, PathBuf)> = vec![
+                ("state_dir".into(), self.state_dir.clone()),
+                ("logs.dir".into(), self.log_dir()),
+            ];
+            for (name, store) in self.stores.iter().filter(|(_, s)| !s.is_s3()) {
+                local.push((format!("store {name}"), PathBuf::from(&store.url)));
+            }
+            for other in &self.pipelines {
+                if let Some(backup) = &other.finalize.backup_root {
+                    local.push((format!("pipeline {}'s backup_root", other.name), backup.clone()));
+                }
+            }
+            for (what, dir) in local {
+                if inside(&dir, &p.root) || inside(&p.root, &dir) {
+                    bail!(
+                        "pipeline {}: {what} ({}) and the root must not contain each other \
+                         (ferry would ship what it writes)",
+                        p.name,
+                        dir.display()
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1225,5 +1462,112 @@ mod tests {
         assert_eq!(retry.backoff(1), 30.0);
         assert_eq!(retry.backoff(2), 60.0);
         assert_eq!(retry.backoff(10), 3600.0);
+    }
+
+    #[test]
+    fn adoption_is_off_unless_asked_and_never_by_size_alone_before_a_move() {
+        let adopt = |extra: &str| load(extra).map(|cfg| cfg.pipelines[0].adopt);
+        assert_eq!(adopt("").unwrap(), Adopt::Off);
+        assert_eq!(adopt("    adopt: true\n").unwrap(), Adopt::Size);
+        assert_eq!(adopt("    adopt: false\n").unwrap(), Adopt::Off);
+        assert_eq!(
+            adopt("    adopt: sha256\n    finalize: {action: delete}\n").unwrap(),
+            Adopt::Sha256
+        );
+        let err = adopt("    adopt: size\n    finalize: {action: delete}\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cannot be deleted on its word"), "{err}");
+        assert!(adopt("    adopt: maybe\n").is_err());
+    }
+
+    #[test]
+    fn nothing_writes_where_something_else_does() {
+        let two = |a: &str, b: &str, extra: &str| {
+            Config::from_yaml(
+                &format!(
+                    "state_dir: /tmp/ferry-test-state\n\
+                     stores:\n  raw: {{url: 's3://bucket/raw'}}\n  bucket: {{url: 's3://bucket'}}\n  \
+                     rgw: {{url: 's3://bucket', endpoint: 'https://rgw.lab/'}}\n\
+                     pipelines:\n\
+                     \x20 - {{name: a, root: /tmp/ferry-a, destinations: [{a}]}}\n\
+                     \x20 - {{name: b, root: /tmp/ferry-b, destinations: [{b}]}}\n{extra}"
+                ),
+                &base(),
+            )
+        };
+        let err = two("raw", "bucket", "").unwrap_err().to_string();
+        assert!(
+            err.contains("overlapping places (s3://bucket/raw and s3://bucket/)"),
+            "{err}"
+        );
+        assert!(two("raw", "raw", "").is_err());
+        two("{store: raw, prefix: x}", "{store: raw, prefix: y}", "").unwrap();
+        two("raw", "rgw", "").unwrap();
+        let shipped = two(
+            "raw",
+            "{store: bucket, prefix: b}",
+            "logs: {ship: {store: bucket, prefix: raw/_ferry}}\n",
+        );
+        assert!(shipped.unwrap_err().to_string().contains("logs.ship"));
+
+        let cfg = two("raw", "rgw", "").unwrap();
+        let (p, d) = (&cfg.pipelines[1], &cfg.pipelines[1].destinations[0]);
+        assert_eq!(cfg.destination_identity(p, d), "s3://bucket/ via https://rgw.lab");
+    }
+
+    #[test]
+    fn a_local_store_may_not_sit_in_a_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("data");
+        std::fs::create_dir_all(root.join("copies")).unwrap();
+        let err = Config::from_yaml(
+            &format!(
+                "state_dir: state\nstores: {{here: {{url: '{}'}}}}\npipelines:\n  - {{name: a, root: '{}', destinations: [here]}}\n",
+                root.join("copies").display(),
+                root.display()
+            ),
+            dir.path(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("store here"), "{err}");
+    }
+
+    #[test]
+    fn notifiers_take_alerts_unless_told_otherwise() {
+        let cfg = load(
+            "notifiers:\n  - webhook: https://chat.example/a\n  - name: arrivals\n    webhook: https://chat.example/b\n    events: [receipt]\n    format: event\n  - exec: [/opt/bin/page-oncall.sh]\n    events: [alert, receipt]\n",
+        )
+        .unwrap();
+        let summary: Vec<(String, Vec<NotifierEvent>, Option<WebhookFormat>)> = cfg
+            .notifiers
+            .iter()
+            .map(|n| (n.key(), n.events.clone(), n.format))
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                ("webhook".into(), vec![NotifierEvent::Alert], None),
+                (
+                    "arrivals".into(),
+                    vec![NotifierEvent::Receipt],
+                    Some(WebhookFormat::Event)
+                ),
+                (
+                    "page-oncall".into(),
+                    vec![NotifierEvent::Alert, NotifierEvent::Receipt],
+                    None
+                ),
+            ]
+        );
+
+        let err = |extra: &str| load(extra).unwrap_err().to_string();
+        assert!(err("notifiers:\n  - webhook: a\n    events: []\n").contains("events is empty"));
+        assert!(err("notifiers:\n  - exec: [notify]\n    format: text\n").contains("`format` applies to webhooks"));
+        let twice = "notifiers:\n  - {webhook: a, events: [receipt]}\n  - {webhook: b, events: [receipt]}\n";
+        assert!(err(twice).contains("(webhook repeats)"), "{}", err(twice));
+        // Names only matter where receipts wait: two alert webhooks are fine.
+        load("notifiers:\n  - webhook: a\n  - webhook: b\n").unwrap();
     }
 }

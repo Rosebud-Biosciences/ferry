@@ -353,6 +353,40 @@ async fn verify(target: &Target, size: u64, sha256: &str) -> Result<Verify, Stri
     Ok(target.verify)
 }
 
+/// A local file's SHA-256, and its size and mtime before and after the read.
+pub struct Hashed {
+    pub sha256: String,
+    pub before: (u64, i64),
+    pub after: (u64, i64),
+}
+
+impl Hashed {
+    /// The file had size and mtime `stats` throughout the read.
+    pub fn steady_at(&self, stats: (u64, i64)) -> bool {
+        self.before == stats && self.after == stats
+    }
+}
+
+pub fn hash_file(path: &Path) -> io::Result<Hashed> {
+    let before = stats(&fs::metadata(path)?);
+    let mut file = fs::File::open(path)?;
+    let mut ctx = digest::Context::new(&digest::SHA256);
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        ctx.update(&buf[..n]);
+    }
+    let after = stats(&fs::metadata(path)?);
+    Ok(Hashed {
+        sha256: sha_hex(ctx.finish()),
+        before,
+        after,
+    })
+}
+
 pub async fn readback_sha256(target: &Target) -> Result<String, String> {
     let key = target.location.key(&target.rel).map_err(describe)?;
     let mut stream = target
@@ -438,7 +472,7 @@ pub fn debit(tokens: f64, elapsed: f64, rate: f64, nbytes: u64) -> (f64, f64) {
 /// rename. Across file systems the copy is written under a temporary name,
 /// fsync'd and size-checked, then renamed into place and `src` deleted, so
 /// neither a crash nor a short copy leaves the only good copy half-written.
-pub fn move_file(src: &Path, dst: &Path) -> io::Result<u64> {
+pub fn move_file(src: &Path, dst: &Path, sha256: Option<&str>) -> io::Result<u64> {
     let meta = fs::metadata(src)?;
     let size = meta.len();
     if let Some(parent) = dst.parent() {
@@ -449,28 +483,47 @@ pub fn move_file(src: &Path, dst: &Path) -> io::Result<u64> {
         Err(e) if e.kind() == io::ErrorKind::CrossesDevices => {}
         Err(e) => return Err(e),
     }
-    copy_across(src, dst, &meta)
+    copy_across(src, dst, &meta, sha256)
 }
 
-pub fn copy_across(src: &Path, dst: &Path, meta: &fs::Metadata) -> io::Result<u64> {
+/// Copy `src` to `dst` on another file system, hashing on the way: the copy
+/// must have the size and (if given) the SHA-256 of what was uploaded before
+/// `src` is removed.
+pub fn copy_across(src: &Path, dst: &Path, meta: &fs::Metadata, sha256: Option<&str>) -> io::Result<u64> {
     let size = meta.len();
     let mut partial = dst.as_os_str().to_owned();
     partial.push(".ferry-partial");
     let partial = std::path::PathBuf::from(partial);
-    fs::copy(src, &partial)?;
-    let file = fs::OpenOptions::new().write(true).open(&partial)?;
-    if let Ok(modified) = meta.modified() {
-        let _ = file.set_modified(modified);
+    let mut reader = fs::File::open(src)?;
+    let mut writer = fs::File::create(&partial)?;
+    let mut ctx = digest::Context::new(&digest::SHA256);
+    let mut buf = vec![0u8; 1 << 20];
+    let mut copied = 0u64;
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        ctx.update(&buf[..n]);
+        io::Write::write_all(&mut writer, &buf[..n])?;
+        copied += n as u64;
     }
-    file.sync_all()?;
-    drop(file);
-    let copied = fs::metadata(&partial)?.len();
-    if copied != size {
+    if let Ok(modified) = meta.modified() {
+        let _ = writer.set_modified(modified);
+    }
+    writer.sync_all()?;
+    drop(writer);
+    let got = sha_hex(ctx.finish());
+    let wrong = if copied != size {
+        Some(format!("copy of {} is {copied} bytes, expected {size}", src.display()))
+    } else {
+        sha256
+            .filter(|want| *want != got)
+            .map(|want| format!("{} hashes to {got}, not {want} as uploaded", src.display()))
+    };
+    if let Some(error) = wrong {
         let _ = fs::remove_file(&partial);
-        return Err(io::Error::other(format!(
-            "copy of {} is {copied} bytes, expected {size}",
-            src.display()
-        )));
+        return Err(io::Error::other(error));
     }
     fs::rename(&partial, dst)?;
     fs::remove_file(src)?;
@@ -623,7 +676,7 @@ mod tests {
         fs::create_dir_all(src.parent().unwrap()).unwrap();
         fs::write(&src, b"payload").unwrap();
         let dst = dir.path().join("b/deep/x.bin");
-        assert_eq!(move_file(&src, &dst).unwrap(), 7);
+        assert_eq!(move_file(&src, &dst, None).unwrap(), 7);
         assert_eq!(fs::read(&dst).unwrap(), b"payload");
         assert!(!src.exists());
 
@@ -631,7 +684,7 @@ mod tests {
         let meta = fs::metadata(&src).unwrap();
         let dst = dir.path().join("c/x.bin");
         fs::create_dir_all(dst.parent().unwrap()).unwrap();
-        assert_eq!(copy_across(&src, &dst, &meta).unwrap(), 7);
+        assert_eq!(copy_across(&src, &dst, &meta, Some(&sha(b"payload"))).unwrap(), 7);
         assert_eq!(fs::read(&dst).unwrap(), b"payload");
         assert_eq!(
             fs::metadata(&dst).unwrap().modified().unwrap(),
@@ -639,6 +692,20 @@ mod tests {
         );
         assert!(!src.exists());
         assert_eq!(fs::read_dir(dst.parent().unwrap()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn a_copy_that_does_not_hash_as_uploaded_leaves_the_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("x.bin");
+        fs::write(&src, b"rewritten").unwrap();
+        let meta = fs::metadata(&src).unwrap();
+        let dst = dir.path().join("backup.bin");
+
+        let err = copy_across(&src, &dst, &meta, Some(&sha(b"original!"))).unwrap_err();
+        assert!(err.to_string().contains("not"), "{err}");
+        assert!(src.exists() && !dst.exists());
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1, "no partial copy left");
     }
 
     #[test]
