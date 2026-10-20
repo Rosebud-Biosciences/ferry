@@ -1,8 +1,13 @@
 name: Release
 
-# Push a tag `vX.Y.Z` (matching Cargo.toml's version) to build wheels for each
-# platform and publish them to PyPI (trusted publishing: configure the
-# `pypi` environment on PyPI first). Binaries are attached to a GitHub release.
+# Push a tag `vX.Y.Z` -- Cargo.toml's version, with a `## [X.Y.Z]` section in
+# CHANGELOG.md -- to run CI on it, build and smoke-test a wheel per platform,
+# publish them to PyPI (trusted publishing: configure the `pypi` environment
+# on PyPI first), and attach them, a standalone binary per platform (the
+# wheel's own), the sdist and SHA256SUMS to a GitHub release. Every file gets a
+# build provenance attestation: `gh attestation verify FILE -R
+# Rosebud-Biosciences/ferry`. Run it by hand to build everything without
+# publishing.
 on:
   push:
     tags: ["v*"]
@@ -12,13 +17,41 @@ permissions:
   contents: read
 
 jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.read.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: read
+        name: The tag names Cargo.toml's version, and the changelog has it
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [[ "$GITHUB_REF" == refs/tags/* && "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "::error::tag $GITHUB_REF_NAME does not name Cargo.toml's version, $version"
+            exit 1
+          fi
+          if ! grep -qF "## [$version]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no '## [$version]' section"
+            exit 1
+          fi
+          if [[ "$GITHUB_REF" == refs/tags/* ]] && ! grep -qE "^## \[${version//./\\.}\] - [0-9]{4}-[0-9]{2}-[0-9]{2}$" CHANGELOG.md; then
+            echo "::error::date CHANGELOG.md's '## [$version]' section (- YYYY-MM-DD) before tagging it"
+            exit 1
+          fi
+
+  ci:
+    uses: ./.github/workflows/ci.yml
+
   wheels:
+    needs: [version, ci]
     strategy:
       fail-fast: false
       matrix:
         include:
           - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, manylinux: auto }
-          - { os: ubuntu-latest, target: aarch64-unknown-linux-gnu, manylinux: auto }
+          - { os: ubuntu-latest, target: aarch64-unknown-linux-gnu, manylinux: auto, emulate: linux/arm64 }
           - { os: windows-latest, target: x86_64-pc-windows-msvc }
           - { os: windows-11-arm, target: aarch64-pc-windows-msvc }
           - { os: macos-latest, target: aarch64-apple-darwin }
@@ -32,12 +65,35 @@ jobs:
           target: ${{ matrix.target }}
           args: --release --locked --out dist
           manylinux: ${{ matrix.manylinux || '' }}
+      - uses: actions/setup-python@v7
+        if: ${{ !matrix.emulate }}
+        with:
+          python-version: "3.13"
+      - name: Install the wheel and run it
+        if: ${{ !matrix.emulate }}
+        shell: bash
+        run: |
+          python -m venv smoke
+          bin=smoke/bin
+          [ -d "$bin" ] || bin=smoke/Scripts
+          "$bin/python" -m pip install --no-index dist/*.whl
+          "$bin/ferry" --version
+          "$bin/ferry" schema event > /dev/null
+      - uses: docker/setup-qemu-action@v4
+        if: ${{ matrix.emulate }}
+      - name: Install the wheel and run it, emulated
+        if: ${{ matrix.emulate }}
+        run: |
+          docker run --rm --platform "${{ matrix.emulate }}" -e PIP_ROOT_USER_ACTION=ignore \
+            -v "$PWD/dist:/dist:ro" python:3.13-slim \
+            sh -c 'pip install --no-index /dist/*.whl && ferry --version && ferry schema event > /dev/null'
       - uses: actions/upload-artifact@v7
         with:
           name: wheel-${{ matrix.target }}
           path: dist
 
   sdist:
+    needs: [version, ci]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -50,23 +106,64 @@ jobs:
           name: sdist
           path: dist
 
+  binaries:
+    needs: [version, wheels]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: wheel-*
+          path: wheels
+      - run: python3 .github/scripts/package_binaries.py "${{ needs.version.outputs.version }}" wheels binaries
+      - uses: actions/upload-artifact@v7
+        with:
+          name: binaries
+          path: binaries
+
   publish:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [wheels, sdist]
+    needs: [version, wheels, sdist, binaries]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
-      id-token: write
-      contents: write
+      id-token: write # PyPI trusted publishing, and the attestations
+      attestations: write
+      contents: write # the GitHub release
     steps:
+      - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
+          pattern: wheel-*
           path: dist
           merge-multiple: true
+      - uses: actions/download-artifact@v8
+        with:
+          name: sdist
+          path: dist
+      - uses: actions/download-artifact@v8
+        with:
+          name: binaries
+          path: binaries
+      - name: Checksums
+        run: |
+          mkdir release
+          cp dist/* binaries/* release/
+          (cd release && sha256sum -- * > SHA256SUMS)
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: release/*
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist
+          skip-existing: true
       - name: GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --generate-notes
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          awk -v v="[$VERSION]" '/^## \[/ { found = index($0, v) > 0; next } found' CHANGELOG.md > notes.md
+          prerelease=()
+          [[ "$VERSION" == *-* ]] && prerelease=(--prerelease)
+          gh release create "$GITHUB_REF_NAME" release/* --repo "$GITHUB_REPOSITORY" \
+            --title "ferry $VERSION" --notes-file notes.md "${prerelease[@]}"

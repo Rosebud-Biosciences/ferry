@@ -28,6 +28,12 @@ uv tool install ferry-ingest          # or: pip install ferry-ingest (a prebuilt
 cargo install --locked --git https://github.com/Rosebud-Biosciences/ferry   # or build it from source
 ```
 
+Each [GitHub release](https://github.com/Rosebud-Biosciences/ferry/releases)
+also has a standalone `ferry` per platform -- the binary its wheel holds --
+and `SHA256SUMS`. Every file carries a build provenance attestation: `gh
+attestation verify FILE -R Rosebud-Biosciences/ferry` shows that this
+repository's release workflow built it.
+
 ## Quickstart
 
 ```yaml
