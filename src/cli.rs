@@ -59,6 +59,10 @@ enum Command {
     Watch {
         #[arg(short, long)]
         verbose: bool,
+        /// Serve /metrics and /healthz at this address and port (for example
+        /// 127.0.0.1:9187), instead of at `metrics.listen`.
+        #[arg(long, value_name = "ADDR")]
+        metrics: Option<String>,
     },
     /// What the journal knows: units by state, backlog and failures.
     Status {
@@ -230,8 +234,8 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             dry_run,
             verbose,
         } => run(&config, pipelines, dry_run, verbose),
-        Command::Watch { verbose } => {
-            serve_with(&config, CancellationToken::new(), true, verbose, true)?;
+        Command::Watch { verbose, metrics } => {
+            serve_with(&config, CancellationToken::new(), true, verbose, true, metrics)?;
             Ok(ExitCode::SUCCESS)
         }
         Command::Status { pipelines, units, json } => status(&config, pipelines, units, json),
@@ -489,11 +493,22 @@ fn run(config: &Path, pipelines: Vec<String>, dry_run: bool, verbose: bool) -> R
 
 /// `ferry watch` until `stop` (the Windows service's entry point too).
 pub fn serve(config: &Path, stop: CancellationToken, console: bool) -> Result<()> {
-    serve_with(config, stop, console, false, false)
+    serve_with(config, stop, console, false, false, None)
 }
 
-fn serve_with(config: &Path, stop: CancellationToken, console: bool, verbose: bool, signals: bool) -> Result<()> {
-    let cfg = load(config)?;
+fn serve_with(
+    config: &Path,
+    stop: CancellationToken,
+    console: bool,
+    verbose: bool,
+    signals: bool,
+    metrics: Option<String>,
+) -> Result<()> {
+    let mut cfg = load(config)?;
+    if let Some(listen) = metrics {
+        crate::config::listen_address(&listen).context("--metrics")?;
+        cfg.metrics = Some(crate::config::MetricsConfig { listen });
+    }
     let _logs = logging(&cfg, verbose, console, true)?;
     runtime()?.block_on(async move {
         let agent = Arc::new(Agent::open(cfg, AgentOptions::default())?);

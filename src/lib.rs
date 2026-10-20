@@ -16,6 +16,7 @@ pub mod journal;
 pub mod lock;
 pub mod logs;
 pub mod manifest;
+pub mod metrics;
 pub mod runner;
 pub mod schedule;
 pub mod service;

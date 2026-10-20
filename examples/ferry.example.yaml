@@ -107,6 +107,9 @@ logs:
       - exec: [python, -m, my_catalog.ferry_hook]
         cwd: C:/ferry-hooks
 
+metrics:                           # Prometheus /metrics and /healthz, in `ferry watch`
+  listen: 127.0.0.1:9187           # no authentication: keep it local or on a management network
+
 notifiers:
   - webhook: ${FERRY_ALERT_WEBHOOK}   # Slack-compatible incoming webhook
     min_level: warning               # info also sends each pass's digest

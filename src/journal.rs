@@ -383,6 +383,17 @@ impl TransferRow {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransferTotal {
+    pub pipeline: String,
+    /// Empty for moves and deletes, which have no destination.
+    pub dest: String,
+    pub op: String,
+    pub status: String,
+    pub count: i64,
+    pub bytes: i64,
+}
+
 /// One transfer to record (an upload, adoption, backup move or delete).
 #[derive(Debug, Clone, Default)]
 pub struct NewTransfer<'a> {
@@ -1133,6 +1144,32 @@ impl Journal {
     }
 
     // -- transfers ----------------------------------------------------------
+    /// Transfers recorded after the one with id `after`, totalled by pipeline,
+    /// destination, op and status; and the id of the last one counted.
+    /// Transfers are never deleted, so totals only grow.
+    pub fn transfer_totals(&self, after: i64) -> Result<(Vec<TransferTotal>, i64)> {
+        let last: i64 = self
+            .conn
+            .query_row("SELECT COALESCE(MAX(id), ?) FROM transfer", [after], |r| r.get(0))?;
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT pipeline, COALESCE(dest, ''), op, status, COUNT(*), COALESCE(SUM(bytes), 0) FROM transfer \
+             WHERE id > ? AND id <= ? GROUP BY pipeline, dest, op, status",
+        )?;
+        let totals = stmt
+            .query_map([after, last], |r| {
+                Ok(TransferTotal {
+                    pipeline: r.get(0)?,
+                    dest: r.get(1)?,
+                    op: r.get(2)?,
+                    status: r.get(3)?,
+                    count: r.get(4)?,
+                    bytes: r.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok((totals, last))
+    }
+
     pub fn add_transfer(&self, t: &NewTransfer) -> Result<i64> {
         self.conn.execute(
             "INSERT INTO transfer (pipeline, unit_id, rel, dest, op, status, src, dst, bytes, \

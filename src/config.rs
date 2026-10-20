@@ -843,6 +843,13 @@ pub const CONFIG_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct MetricsConfig {
+    /// Where `ferry watch` serves `/metrics` and `/healthz`, e.g. `127.0.0.1:9187`.
+    pub listen: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     /// The config format; a config newer than this ferry reads is refused.
     #[serde(default)]
@@ -856,6 +863,7 @@ pub struct Config {
     pub logs: LogsConfig,
     #[serde(default)]
     pub notifiers: Vec<NotifierConfig>,
+    pub metrics: Option<MetricsConfig>,
 }
 
 shorthand_vec!(de_destinations, DestinationConfig);
@@ -975,6 +983,12 @@ fn is_windows_absolute(path: &Path) -> bool {
         || text.starts_with("\\\\")
 }
 
+/// An address and port to serve on, like `127.0.0.1:9187` or `[::1]:9187`.
+pub fn listen_address(text: &str) -> Result<std::net::SocketAddr> {
+    text.parse()
+        .map_err(|_| anyhow!("{text:?} is not an address and port like 127.0.0.1:9187"))
+}
+
 fn resolve(base: &Path, path: &Path) -> PathBuf {
     let text = path.to_string_lossy();
     let expanded = match (text.strip_prefix("~/"), dirs::home_dir()) {
@@ -1077,6 +1091,9 @@ impl Config {
             && version != CONFIG_VERSION
         {
             bail!("version: this ferry reads version {CONFIG_VERSION} configs, not {version}");
+        }
+        if let Some(metrics) = &self.metrics {
+            listen_address(&metrics.listen).map_err(|e| anyhow!("metrics.listen: {e}"))?;
         }
         if self.pipelines.is_empty() {
             bail!("pipelines: at least one pipeline is required");
@@ -1444,6 +1461,19 @@ mod tests {
         assert_eq!(top("").unwrap().version, None);
         let err = top("version: 2\n").unwrap_err().to_string();
         assert!(err.contains("reads version 1 configs, not 2"), "{err}");
+    }
+
+    #[test]
+    fn metrics_are_served_only_where_asked() {
+        let top = |extra: &str| Config::from_yaml(&format!("{extra}{}", yaml("[s3]", "")), &base());
+        assert!(top("").unwrap().metrics.is_none());
+        let cfg = top("metrics: {listen: '127.0.0.1:9187'}\n").unwrap();
+        assert_eq!(cfg.metrics.unwrap().listen, "127.0.0.1:9187");
+        let err = top("metrics: {listen: ':9187'}\n").unwrap_err().to_string();
+        assert!(
+            err.contains("metrics.listen: \":9187\" is not an address and port"),
+            "{err}"
+        );
     }
 
     #[test]

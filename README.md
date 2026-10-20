@@ -223,6 +223,13 @@ JSON); `exec:` runs a command with the event on stdin.
   sends each notifier a test message.
 - `ferry status [--units] [--json]` shows units by state, the upload backlog,
   and every failing copy or delivery with its last error.
+- `metrics: {listen: 127.0.0.1:9187}` (or `ferry watch --metrics ADDR`) serves
+  the same numbers to Prometheus at `/metrics` -- units by state, the backlog,
+  failing copies and deliveries, each pipeline's last pass, and transfers and
+  bytes by destination and outcome -- and `/healthz`, which answers 200 while
+  the journal does. Neither asks for credentials: keep them on localhost or a
+  management network. A node nothing can scrape can push a heartbeat instead
+  (`logs.ship.heartbeat`).
 - `ferry retry [-p PIPELINE] [-u UNIT]` clears retry backoff (and re-opens an
   abandoned unit). Failures otherwise retry on their own with exponential
   backoff (`retry.initial`, `retry.max`), and alert after `retry.alert_after`
