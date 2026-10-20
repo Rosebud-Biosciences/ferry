@@ -89,9 +89,59 @@ pub fn tail(text: &str, limit: usize) -> &str {
     &text[start..]
 }
 
+/// An env file's variables: `KEY=VALUE` lines, `export ` optional, a value
+/// optionally wrapped in matching quotes; blank lines and `#` comments are
+/// skipped. A `#` inside a value is part of it.
+pub fn parse_env_file(text: &str) -> Result<Vec<(String, String)>, String> {
+    let mut vars = Vec::new();
+    for (i, line) in text.trim_start_matches('\u{feff}').lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line);
+        let Some((key, value)) = line.split_once('=') else {
+            return Err(format!("line {}: expected KEY=VALUE", i + 1));
+        };
+        let key = key.trim();
+        let named = key.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if !named {
+            return Err(format!("line {}: {key:?} is not a variable name", i + 1));
+        }
+        let value = value.trim();
+        let quoted = value.len() >= 2
+            && ((value.starts_with('"') && value.ends_with('"')) || (value.starts_with('\'') && value.ends_with('\'')));
+        let value = if quoted { &value[1..value.len() - 1] } else { value };
+        vars.push((key.to_string(), value.to_string()));
+    }
+    Ok(vars)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn env_files_read_like_systemd_and_docker_write_them() {
+        let text = "\u{feff}# credentials\r\n\
+                    FERRY_S3_KEY=AKIA123\r\n\
+                    export FERRY_S3_SECRET='abc def'\n\
+                    \n\
+                    HOOK_URL=\"https://hooks.example/x#y\"\n\
+                    EMPTY=\n";
+        assert_eq!(
+            parse_env_file(text).unwrap(),
+            [
+                ("FERRY_S3_KEY".into(), "AKIA123".into()),
+                ("FERRY_S3_SECRET".into(), "abc def".into()),
+                ("HOOK_URL".into(), "https://hooks.example/x#y".into()),
+                ("EMPTY".into(), String::new()),
+            ]
+        );
+        assert_eq!(parse_env_file("just words").unwrap_err(), "line 1: expected KEY=VALUE");
+        assert!(parse_env_file("1X=y").unwrap_err().contains("not a variable name"));
+    }
 
     #[test]
     fn sizes_and_durations_read_naturally() {

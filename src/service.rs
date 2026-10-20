@@ -29,6 +29,8 @@ pub struct ServiceSpec {
     pub name: String,
     pub exe: PathBuf,
     pub config: PathBuf,
+    /// Read into the environment first (`--env-file`): the service's secrets.
+    pub env_file: Option<PathBuf>,
     /// A system unit (Linux) rather than a user one. Windows services always
     /// run system-wide, as LocalSystem unless `account` is given.
     pub system: bool,
@@ -44,6 +46,15 @@ impl ServiceSpec {
             self.name,
             self.config.display()
         )
+    }
+
+    /// `--config` and `--env-file`, as every service passes them.
+    fn config_args(&self) -> Vec<String> {
+        let mut args = vec!["--config".into(), self.config.to_string_lossy().into_owned()];
+        if let Some(env_file) = &self.env_file {
+            args.extend(["--env-file".into(), env_file.to_string_lossy().into_owned()]);
+        }
+        args
     }
 }
 
@@ -65,16 +76,12 @@ fn systemd_quote(arg: &str) -> String {
 }
 
 pub fn systemd_unit(spec: &ServiceSpec) -> String {
-    let exec = [
-        spec.exe.to_string_lossy().into_owned(),
-        "watch".into(),
-        "--config".into(),
-        spec.config.to_string_lossy().into_owned(),
-    ]
-    .iter()
-    .map(|a| systemd_quote(a))
-    .collect::<Vec<_>>()
-    .join(" ");
+    let exec = [spec.exe.to_string_lossy().into_owned(), "watch".into()]
+        .into_iter()
+        .chain(spec.config_args())
+        .map(|a| systemd_quote(&a))
+        .collect::<Vec<_>>()
+        .join(" ");
     let workdir = spec.config.parent().unwrap_or(Path::new("/"));
     let wanted_by = if spec.system {
         "multi-user.target"
@@ -131,14 +138,9 @@ fn windows_quote(arg: &str) -> String {
 
 /// The arguments the Windows service starts ferry with.
 pub fn windows_arguments(spec: &ServiceSpec) -> Vec<String> {
-    vec![
-        "service".into(),
-        "run".into(),
-        "--name".into(),
-        spec.name.clone(),
-        "--config".into(),
-        spec.config.to_string_lossy().into_owned(),
-    ]
+    let mut args = vec!["service".into(), "run".into(), "--name".into(), spec.name.clone()];
+    args.extend(spec.config_args());
+    args
 }
 
 /// The `sc.exe` commands equivalent to `ferry service install` on Windows.
@@ -414,6 +416,7 @@ mod tests {
             name: "ferry".into(),
             exe: PathBuf::from("/opt/ferry/bin/ferry"),
             config: PathBuf::from("/etc/ferry/my config.yaml"),
+            env_file: None,
             system: true,
             account: None,
             password: None,
@@ -429,6 +432,28 @@ mod tests {
         );
         assert!(unit.contains("Restart=always"));
         assert!(unit.contains("WantedBy=multi-user.target"));
+    }
+
+    #[test]
+    fn services_read_their_env_file_first() {
+        let spec = ServiceSpec {
+            env_file: Some(PathBuf::from("/etc/ferry/ferry.env")),
+            ..spec()
+        };
+        assert!(
+            systemd_unit(&spec).contains("--env-file /etc/ferry/ferry.env\n"),
+            "{}",
+            systemd_unit(&spec)
+        );
+        assert_eq!(
+            windows_arguments(&spec)[4..],
+            [
+                "--config",
+                "/etc/ferry/my config.yaml",
+                "--env-file",
+                "/etc/ferry/ferry.env"
+            ]
+        );
     }
 
     #[test]

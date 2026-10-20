@@ -31,6 +31,10 @@ struct Cli {
     /// Config file.
     #[arg(short, long, env = "FERRY_CONFIG", default_value = "ferry.yaml", global = true)]
     config: PathBuf,
+    /// KEY=VALUE lines to set in the environment before anything else, such
+    /// as a service's credentials; they replace variables already set.
+    #[arg(long, env = "FERRY_ENV_FILE", global = true)]
+    env_file: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -204,6 +208,10 @@ pub fn main() -> ExitCode {
 
 fn dispatch(cli: Cli) -> Result<ExitCode> {
     let config = std::path::absolute(&cli.config)?;
+    let env_file = cli.env_file.as_deref().map(std::path::absolute).transpose()?;
+    if let Some(path) = &env_file {
+        load_env_file(path)?;
+    }
     match cli.command {
         Command::Run {
             pipelines,
@@ -271,13 +279,45 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             println!("{}", serde_json::to_string_pretty(&schema)?);
             Ok(ExitCode::SUCCESS)
         }
-        Command::Service(command) => service_command(&config, command),
+        Command::Service(command) => service_command(&config, env_file.as_deref(), command),
     }
 }
 
 fn fail(message: &str) -> Result<ExitCode> {
     eprintln!("{message}");
     Ok(ExitCode::from(1))
+}
+
+/// Set the variables in the env file `path`, warning if others can read it.
+fn load_env_file(path: &Path) -> Result<()> {
+    let text = std::fs::read_to_string(path).with_context(|| format!("cannot read env file {}", path.display()))?;
+    let vars = crate::util::parse_env_file(&text).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+    if let Some(warning) = exposure(path) {
+        eprintln!("warning: {warning}");
+    }
+    for (key, value) in vars {
+        // SAFETY: `dispatch` calls this before anything starts another thread.
+        unsafe { std::env::set_var(key, value) };
+    }
+    Ok(())
+}
+
+/// Why a file of secrets at `path` is readable by other users, if it is.
+pub fn exposure(path: &Path) -> Option<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path).ok()?.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Some(format!(
+                "{} can be read by other users (mode {mode:o}); `chmod 600` it",
+                path.display()
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    None
 }
 
 fn destination_command(cfg: &Config, command: DestinationCommand) -> Result<ExitCode> {
@@ -655,12 +695,13 @@ fn find_program(program: &str, cwd: Option<&Path>) -> Option<PathBuf> {
     std::env::split_paths(&std::env::var_os("PATH")?).find_map(|dir| found(&dir.join(program)))
 }
 
-fn service_command(config: &Path, command: ServiceCommand) -> Result<ExitCode> {
+fn service_command(config: &Path, env_file: Option<&Path>, command: ServiceCommand) -> Result<ExitCode> {
     let spec = |name: String, system: bool, account: Option<String>, password: Option<String>| -> Result<ServiceSpec> {
         Ok(ServiceSpec {
             name,
             exe: std::env::current_exe()?,
             config: config.to_path_buf(),
+            env_file: env_file.map(Path::to_path_buf),
             system,
             account,
             password,

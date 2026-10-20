@@ -13,6 +13,7 @@ fn ferry(config: &Path) -> Command {
     cmd.arg("--config")
         .arg(config)
         .env_remove("FERRY_CONFIG")
+        .env_remove("FERRY_ENV_FILE")
         .env("FERRY_LOG", "warn");
     cmd
 }
@@ -317,6 +318,42 @@ fn schedule_lists_the_next_passes_in_the_pipeline_zone() {
         lines[1].trim().ends_with("02:00 CET") || lines[1].trim().ends_with("02:00 CEST"),
         "{text}"
     );
+}
+
+#[test]
+fn an_env_file_fills_in_the_config_and_goes_with_the_service() {
+    let site = Site::new("", "");
+    let text = std::fs::read_to_string(&site.config)
+        .unwrap()
+        .replace("node: test-node", "node: ${FERRY_TEST_NODE}");
+    std::fs::write(&site.config, text).unwrap();
+    let env = site.path("ferry.env");
+    std::fs::write(&env, "# the service's secrets\nFERRY_TEST_NODE=from-the-env-file\n").unwrap();
+
+    let validated = ferry(&site.config)
+        .arg("--env-file")
+        .arg(&env)
+        .args(["config", "validate"])
+        .assert()
+        .success()
+        .stdout(predicate::str::starts_with("node from-the-env-file;"));
+    if cfg!(unix) {
+        validated.stderr(predicate::str::contains("`chmod 600` it"));
+    }
+    ferry(&site.config)
+        .arg("--env-file")
+        .arg(&env)
+        .args(["service", "print", "--platform", "systemd"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(" --env-file "));
+    ferry(&site.config)
+        .arg("--env-file")
+        .arg(site.path("missing.env"))
+        .args(["config", "validate"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("cannot read env file"));
 }
 
 #[test]

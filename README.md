@@ -241,6 +241,16 @@ JSON); `exec:` runs a command with the event on stdin.
   `--account` to run as a user that can reach network shares) or a systemd unit
   (`--system` for a system unit). `ferry service print` shows the definition
   without installing it.
+- Keep a service's secrets in an env file, not in the config or the machine's
+  environment: `KEY=VALUE` lines that `--env-file PATH` (or `FERRY_ENV_FILE`)
+  sets before the config loads, so its `${VAR}`s, the `AWS_*` variables and
+  hooks all see them. `ferry --env-file PATH service install` makes the
+  service read it too. Only the account the service runs as should be able to
+  read the file:
+  - Linux and macOS: `chmod 600 ferry.env`, owned by that account (root for a
+    system service); ferry warns about a file others can read.
+  - Windows: `icacls C:\ProgramData\ferry\ferry.env /inheritance:r /grant:r
+    SYSTEM:R Administrators:F` (and grant the `--account`, if one is set).
 
 ## Compatibility
 
