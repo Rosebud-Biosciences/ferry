@@ -310,6 +310,10 @@ The S3 tests run when `FERRY_TEST_S3_ENDPOINT` (plus `FERRY_TEST_S3_KEY`,
 API, as CI does with SeaweedFS. [`docs/design.md`](docs/design.md) covers the
 architecture and the reasoning behind it.
 
+Contributions are welcome: [CONTRIBUTING.md](CONTRIBUTING.md) says how, and
+taking part means following the [Code of Conduct](CODE_OF_CONDUCT.md). Report
+security problems privately, as [SECURITY.md](SECURITY.md) describes.
+
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).
