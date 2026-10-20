@@ -632,6 +632,186 @@ mod tests {
         assert!(!dir.path().join("a/u/x.bin").exists());
     }
 
+    type Tamper = Arc<std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>>;
+
+    fn fire(tamper: &Tamper) {
+        if let Some(tamper) = tamper.lock().unwrap().take() {
+            tamper();
+        }
+    }
+
+    /// A local store that runs `tamper` once, as the first write lands (a
+    /// single PUT, or a multipart upload's first part).
+    struct Tampering {
+        inner: Arc<dyn object_store::ObjectStore>,
+        tamper: Tamper,
+    }
+
+    impl std::fmt::Debug for Tampering {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "Tampering({})", self.inner)
+        }
+    }
+
+    impl std::fmt::Display for Tampering {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "Tampering({})", self.inner)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl object_store::ObjectStore for Tampering {
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            fire(&self.tamper);
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            let inner = self.inner.put_multipart_opts(location, opts).await?;
+            Ok(Box::new(TamperingUpload {
+                inner,
+                tamper: self.tamper.clone(),
+            }))
+        }
+
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    struct TamperingUpload {
+        inner: Box<dyn object_store::MultipartUpload>,
+        tamper: Tamper,
+    }
+
+    impl std::fmt::Debug for TamperingUpload {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "TamperingUpload")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl object_store::MultipartUpload for TamperingUpload {
+        fn put_part(&mut self, data: PutPayload) -> object_store::UploadPart {
+            fire(&self.tamper);
+            self.inner.put_part(data)
+        }
+
+        async fn complete(&mut self) -> object_store::Result<object_store::PutResult> {
+            self.inner.complete().await
+        }
+
+        async fn abort(&mut self) -> object_store::Result<()> {
+            self.inner.abort().await
+        }
+    }
+
+    fn tampering(dir: &Path, tamper: impl FnOnce() + Send + 'static) -> Vec<Target> {
+        let plain = local(dir);
+        let store = Arc::new(crate::stores::Store {
+            name: plain.store.name.clone(),
+            inner: Arc::new(Tampering {
+                inner: plain.store.inner.clone(),
+                tamper: Arc::new(std::sync::Mutex::new(Some(Box::new(tamper)))),
+            }),
+            base: plain.store.base.clone(),
+            uri: plain.store.uri.clone(),
+            limiter: None,
+        });
+        vec![Target {
+            dest: "d0".into(),
+            location: Location::root(store),
+            rel: "u/x.bin".into(),
+            verify: Verify::Size,
+        }]
+    }
+
+    #[tokio::test]
+    async fn a_file_rewritten_during_a_single_put_is_not_taken_as_sent() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("x.bin");
+        fs::write(&src, b"first").unwrap();
+        let modified = fs::metadata(&src).unwrap().modified().unwrap();
+        let rewrite = src.clone();
+        let targets = tampering(&dir.path().join("a"), move || {
+            fs::write(&rewrite, b"FIRST").unwrap();
+            let file = fs::File::options().write(true).open(&rewrite).unwrap();
+            file.set_modified(modified + std::time::Duration::from_secs(2)).unwrap();
+        });
+
+        let out = upload(&src, None, &targets, &SMALL).await;
+        assert!(
+            matches!(&out, Err(ReadError::Changed(m)) if m.contains("while it was uploading")),
+            "{out:?}"
+        );
+    }
+
+    // Replacing the file leaves the reader on the old one, which it reads to
+    // the end: only the length check before committing can tell.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_file_replaced_during_a_multipart_upload_is_never_committed() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("x.bin");
+        fs::write(&src, vec![1u8; 100 * 1024]).unwrap();
+        let (replace, staged) = (src.clone(), dir.path().join("x.new"));
+        let remote = dir.path().join("a");
+        let targets = tampering(&remote, move || {
+            fs::write(&staged, vec![2u8; 200 * 1024]).unwrap();
+            fs::rename(&staged, &replace).unwrap();
+        });
+
+        let out = upload(&src, None, &targets, &SMALL).await;
+        assert!(
+            matches!(&out, Err(ReadError::Changed(m)) if m.contains("while it was uploading")),
+            "{out:?}"
+        );
+        assert!(!remote.join("u/x.bin").exists(), "nothing was committed");
+    }
+
     #[tokio::test]
     async fn verification_catches_a_short_or_corrupted_copy() {
         let dir = tempfile::tempdir().unwrap();
