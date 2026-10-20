@@ -1,319 +1,299 @@
 # ferry
 
-**An edge agent that ships instrument data from watched folders to one or more
-S3-compatible stores -- AWS S3, Ceph RGW, SeaweedFS, MinIO -- on a cron
-schedule or as it lands, and tells your catalog about every acquisition.**
+[![CI](https://github.com/Rosebud-Biosciences/ferry/actions/workflows/ci.yml/badge.svg)](https://github.com/Rosebud-Biosciences/ferry/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/ferry-ingest)](https://pypi.org/project/ferry-ingest/)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](https://github.com/Rosebud-Biosciences/ferry/blob/main/LICENSE)
 
-Lab instruments write acquisitions to a local disk. ferry runs on the
-instrument PC (Windows, Linux or macOS) as one small binary. Each *pipeline*
-watches a folder, groups its files into *units* (one acquisition each), uploads
-them once they have finished being written -- to every destination the
-pipeline names, from a single read -- verifies the copies, hands each complete
-unit to your *registrars* (any command; the event arrives as JSON on stdin),
-and then keeps, moves or deletes the local copies. A local SQLite journal makes
-every step resumable, and every action is logged locally as JSON lines.
+**Get instrument data off the acquisition PC and into S3-compatible storage --
+verified, cataloged, and only then cleaned up.**
 
-ferry is for write-once data: acquisitions that land, settle and are then left
-alone -- from instruments, sensors, cameras and the like. It is not a backup,
-sync or mirror tool for folders whose files keep changing, and it never
-deletes from a store.
+ferry is one small binary that runs on the instrument PC (Windows, Linux or
+macOS). It watches the folders your instruments write to, waits for each
+acquisition to finish, uploads it to one or more stores -- AWS S3, Ceph RGW,
+MinIO, SeaweedFS or a network share -- and verifies every copy. Then it tells
+your catalog, and only then keeps, moves or deletes the originals.
 
-> Status: alpha (`0.1.0-alpha.1`). The command is `ferry`; the crate and the
-> PyPI distribution are `ferry-ingest`.
+> **Status: alpha.** `0.1.0-alpha.1` is the first release. Until 1.0, a minor
+> release may change behavior; the
+> [changelog](https://github.com/Rosebud-Biosciences/ferry/blob/main/CHANGELOG.md)
+> says how. Bug reports and feedback are very welcome.
+
+## Why ferry
+
+- **Nothing is deleted on trust:** originals go only once every copy is
+  verified and your catalog has confirmed the acquisition.
+- **Whole acquisitions:** each is registered once complete, with its full
+  file list.
+- **One read, many destinations:** each file is read once and streamed to
+  every store.
+- **Resumable:** a local journal carries every step through crashes, reboots
+  and outages.
+- **Plugs into your stack:** hooks are plain commands that get JSON on stdin,
+  to record acquisitions in a catalog, start an analysis, or post receipts to
+  Slack.
+- **Made for instrument PCs:** a native Windows service, network shares,
+  bandwidth limits by time of day, and nothing else to install.
+
+ferry is for write-once data: acquisitions that land, settle and are left
+alone. It is not a backup or sync tool, and it never deletes anything from a
+store.
 
 ## Install
 
 ```bash
-uv tool install ferry-ingest          # or: pip install ferry-ingest (a prebuilt binary wheel)
-cargo install --locked --git https://github.com/Rosebud-Biosciences/ferry   # or build it from source
+uv tool install ferry-ingest    # or pipx / pip install ferry-ingest: a prebuilt binary
 ```
 
-Each [GitHub release](https://github.com/Rosebud-Biosciences/ferry/releases)
-also has a standalone `ferry` per platform -- the binary its wheel holds --
-and `SHA256SUMS`. Every file carries a build provenance attestation: `gh
-attestation verify FILE -R Rosebud-Biosciences/ferry` shows that this
-repository's release workflow built it.
+- **Standalone binaries** for Linux, Windows and macOS, on x86-64 and ARM64,
+  come with every [release](https://github.com/Rosebud-Biosciences/ferry/releases),
+  along with `SHA256SUMS`. `gh attestation verify FILE -R
+  Rosebud-Biosciences/ferry` confirms a file was built by this repository.
+- **From source** (Rust 1.89 or later):
+  `cargo install --locked --git https://github.com/Rosebud-Biosciences/ferry`
+
+The package is `ferry-ingest`; the command it installs is `ferry`.
 
 ## Quickstart
 
+**1. Describe the folder and the store** in `ferry.yaml`:
+
 ```yaml
-# ferry.yaml
-state_dir: ./state
+state_dir: ./state                      # ferry's journal, logs and lock
 stores:
-  ceph:
+  lab:
     url: s3://instrument-raw/
-    endpoint: https://rgw.lab.internal
+    endpoint: https://rgw.lab.internal  # Ceph RGW, MinIO, SeaweedFS; leave out for AWS
     region: default
     options:
       aws_access_key_id: ${FERRY_S3_KEY}
       aws_secret_access_key: ${FERRY_S3_SECRET}
-  archive:
-    url: s3://lab-archive/
-    region: us-west-2
 pipelines:
   - name: cytation
-    root: C:/Data/Cytation5
-    prefix: workcell/raw
-    destinations: [ceph, {store: archive, verify: sha256}]
-    unit: {dirs: "*__*"}     # each matching top-level folder is one acquisition
-    include: ["*.tif"]
-    mode: cron
-    cron: "0 2 * * *"
-    finalize: {action: delete, after: 1d}
-    registrars: [manifest]
+    root: C:/Data/Cytation5             # where the instrument writes
+    destinations: [lab]
+    unit: {dirs: "*"}                   # each top-level folder is one acquisition
+    registrars: [manifest]              # write a manifest next to the data
+    # finalize: {action: delete, after: 1d}   # once you trust it: free the disk
 ```
+
+`${FERRY_S3_KEY}` and the like are read from the environment. To try ferry
+without S3, point the store at a folder instead (`url: ./bucket`).
+
+**2. Check it**, and see what a pass would do without changing anything:
 
 ```bash
-ferry config validate          # parse and check it; show where data goes
-ferry doctor --write           # can this node reach its stores and hooks?
-ferry run --dry-run            # what a pass would upload, register and finalize
-ferry run                      # one pass over every pipeline, then exit
-ferry watch                    # run until stopped (cron and stream pipelines)
-ferry service install          # start `ferry watch` at boot, restart on failure
-ferry status                   # units by state, backlog, failures
+ferry config validate    # parse the config; show where each pipeline sends data
+ferry doctor --write     # can this PC reach its stores and find its hooks?
+ferry run --dry-run      # what a pass would upload, register and finalize
 ```
 
-[`examples/ferry.example.yaml`](examples/ferry.example.yaml) annotates every
-option.
+**3. Run it:**
 
-## Pipelines and destinations
+```bash
+ferry watch              # until stopped
+ferry service install    # or run it as a service
+ferry status             # what has moved, what is waiting, what failed
+```
 
-A config has any number of `pipelines`, each with its own `root`, schedule and
-rules; their roots must not overlap. Each pipeline sends its files to one or
-more `destinations` -- stores, each with an optional `prefix`, and:
+Every option is annotated in
+[`examples/ferry.example.yaml`](https://github.com/Rosebud-Biosciences/ferry/blob/main/examples/ferry.example.yaml).
 
-- `verify: size` (default): a HEAD after the upload confirms the stored size.
-  `verify: sha256` also reads the object back and compares its SHA-256 with the
-  one computed while uploading.
-- `required: true` (default): registration waits for this destination. An
-  optional destination is retried until it has the files, but a unit is
-  registered without it.
+## How it works
 
-With `fanout: shared` (default) a file is read once and every chunk goes to
-every destination that needs it: the chunks are reference-counted, so a second
-destination costs no extra disk reads or copies. A destination that fails
-mid-file drops out and is retried later with its own read; the slowest
-destination paces the rest. `fanout: separate` gives every destination its own
-read instead.
+1. **Watch.** Each *pipeline* watches a folder -- continuously, or on a cron
+   schedule -- and groups its files into *units*, one per acquisition: a
+   folder each (`unit.dirs`), or files grouped by a regex over their paths
+   (`unit.regex`).
+2. **Wait.** A file has *settled* once it has not changed for `settle` (60s).
+   A unit is *complete* once its files have settled and a `marker` file has
+   appeared, or nothing in it has changed for `unit_idle` (10m).
+3. **Upload and verify.** Each file is read once and sent to every
+   *destination*, then checked there: by size, or with `verify: sha256` by
+   reading it back.
+4. **Register.** Once every required destination holds the whole unit, its
+   *registrars* get a JSON event listing every file with its size, SHA-256
+   and copies: your catalog, the built-in manifest, or any command.
+5. **Finalize.** Once *every* destination holds a verified copy and every
+   required registrar has confirmed, the originals are kept, moved to a
+   backup drive, or deleted, after an optional grace period.
 
-## When files travel
-
-Each pipeline picks *when a pass runs* and *what a pass uploads*:
-
-- `mode: cron` runs a pass on a cron expression (`cron: "0 2 * * *"`, read in
-  `timezone:` or the node's local time) inside `ferry watch`. A pass missed
-  while the PC slept runs once on wake.
-- `mode: stream` watches continuously: OS file events (`watch: events`) are
-  hints that trigger a rescan, backed by polling every `poll_interval` and a
-  full walk every `full_scan_interval`. Use `watch: poll` for network shares,
-  which deliver no reliable events.
-- `upload: file` uploads each file as soon as it settles. `upload: unit`
-  (default) waits until the whole unit is complete, then uploads it.
-
-Either way a unit is **registered only once it is complete**:
-
-- A file has *settled* once its mtime is at least `settle` old. With
-  `probe_exclusive: true` (Windows), a file another process holds open has not.
-- A unit is *complete* once all its files have settled and either a `marker`
-  file is present (`images/index.xml`, `run.done`, ...) or nothing in the unit
-  has changed for `unit_idle` -- files ferry does not upload and directory
-  mtimes included.
-- `ferry complete PIPELINE UNIT` ends the wait by hand; a unit open for
-  `max_open` raises an alert.
-
-`ferry run` ignores `mode` and does one pass over every pipeline, for OS
-schedulers and testing.
+Every step is recorded in a local SQLite journal, so ferry resumes where it
+stopped. [The design notes](https://github.com/Rosebud-Biosciences/ferry/blob/main/docs/design.md)
+cover each step in depth.
 
 ## What ferry guarantees
 
-- A copy counts only if the file did not change while it was read (it is
-  stat'd before and after) and the stored object verified. A file whose size
-  or mtime changes later is sent again. ferry tells versions of a file apart
-  by size and mtime; a rewrite that keeps both is caught before a delete,
-  which hashes the file first, and not otherwise.
-- ferry acts only on what it could read. If a scan cannot read part of a unit
-  -- a permission, a share that drops, a name that is not valid Unicode, a
-  symbolic link (links are never followed) -- the unit waits: it does not
-  complete, register or finalize, and nothing the scan missed counts as gone.
-  An alert says what could not be read; `exclude` it if it should not travel.
-- A unit is registered once it is complete and every *required* destination
-  holds a verified copy of every file -- never with a partial file list. Files
-  that change or appear later reopen the unit and register it again, with a
-  higher `generation`.
-- Source files are kept, moved or deleted (`finalize.action: keep | move |
-  delete`) only once **every** destination holds a verified copy, every
-  required registrar has confirmed the unit, and the `finalize.after` grace
-  period (if any) has passed. Before a move or delete, ferry then:
-  - checks that every copy is still there with the size sent and the ETag
-    recorded when it was verified; one that went missing or was overwritten is
-    sent again first;
-  - sets each file aside by renaming it (`name.ferry-finalizing`), so a writer
-    that comes back makes a new file instead of changing the bytes in flight;
-  - checks the file set aside is the one uploaded -- the same size and mtime,
-    and before a delete the same SHA-256 -- and otherwise puts it back and
-    sends it again;
-  - moves it (hashing it on the way if the backup is on another file system)
-    or deletes it, and records that only while the journal still describes
-    those bytes.
-- Copies are tied to where a destination points: its bucket, endpoint and
-  prefix, or its directory. Change that, and ferry stops until you say what
-  happened (see `ferry destination` below). Strengthening `verify` from `size`
-  to `sha256` sends again what the weaker check covered.
-- Every step is journaled, so a crash, reboot or killed process resumes where
-  it stopped -- a move or delete interrupted after the rename included.
-- A lost journal means uploading again, unless the pipeline sets `adopt`.
-  `adopt: sha256` reads back each object already at a destination and counts
-  it if it hashes like the local file. `adopt: size` counts any object with
-  the right key and size, so it is allowed only with `finalize.action: keep`.
+- **Verified, or it does not count.** A copy counts only once verified, and
+  only if the file did not change while it was read. ferry tells versions of
+  a file apart by size and modification time.
+- **Never a partial registration.** Files that change or arrive later reopen
+  the unit, which registers again with a higher `generation`.
+- **Only what it could read.** A folder it cannot list, a share that drops
+  out, a name that is not valid Unicode or a symbolic link (never followed)
+  holds the unit back, with an alert. Nothing ferry could not see counts as
+  gone.
+- **Checked again before a move or delete.** ferry rechecks every copy, sets
+  each file aside by a rename so a late writer cannot change it, and confirms
+  it is the file it uploaded, hashing it again before a delete
+  ([the protocol](https://github.com/Rosebud-Biosciences/ferry/blob/main/docs/design.md#deleting-the-source)).
+- **Copies follow their destination.** Point a destination at a new bucket,
+  endpoint or prefix, and ferry stops until you run `ferry destination
+  accept` or `reset`.
+- **A lost journal costs a re-upload, never data.** With `adopt: sha256`,
+  ferry instead reads back what a destination already holds and keeps each
+  object whose hash matches.
 
-## Stores
+## Configuration
 
-`url: s3://bucket/prefix` uses the `object_store` crate's S3 client: files up
-to `limits.single_put_max` (64 MiB) go up in one PUT, bigger ones stream as
-multipart uploads (`part_size`, `part_concurrency`), and every file's SHA-256 is
-computed on the way and recorded. `options` passes any `object_store` S3
-setting by name; credentials otherwise come from `profile` (static keys in
-`~/.aws/credentials`) or the usual `AWS_*` environment variables.
-`bandwidth: 50MB` caps a store's rate, optionally per local time window
-(`{"08:00-18:00": 50MB}`). A local or mounted directory (`url: /mnt/nas/raw`)
-also works.
+### When files travel
 
-A file goes to `<prefix>/<unit>/<path within the unit>`, its names as the file
-system gives them (no Unicode normalization), each percent-encoded only where a
-key could not hold it faithfully: `%`, `\` and control characters. So `a\b.tif`
-(a legal name on Linux) and `a/b.tif` stay distinct. No two destinations, and
-not log shipping, may write under the same prefix of one bucket or directory.
+| Setting | Default | Alternative |
+| --- | --- | --- |
+| `mode` | `stream`: watch continuously | `cron`: run on a schedule, e.g. `cron: "0 2 * * *"` in `timezone:`; a pass missed while the PC slept runs on wake |
+| `upload` | `unit`: once the whole unit is complete | `file`: each file as soon as it settles |
+| `watch` | `events`: OS file events, backed by polling | `poll`: polling only, for network shares |
+| `fanout` | `shared`: one read feeds every destination | `separate`: each destination reads for itself |
+| `finalize.action` | `keep` | `move` (to `backup_root`) or `delete`; `after:` adds a grace period |
 
-For **Ceph RGW** (and other self-hosted S3):
+### Destinations and stores
 
-- Set `endpoint`. Path-style addressing is the default, which is what RGW
-  expects. Set `region` to the zonegroup name if your RGW checks it.
-- Every request payload is signed (SigV4), so corruption in transit is
-  rejected. `checksum: sha256` asks the server to verify a whole-object
-  checksum as well; only enable it where the server validates it (RGW does
-  from Tentacle). `verify: sha256` checks end to end regardless.
-- Give each node its own RGW user, with a bucket policy allowing `PutObject`,
-  `GetObject`/`HeadObject` and `ListBucket` on its prefixes. ferry never
-  deletes from a store.
-- Add a lifecycle rule that aborts incomplete multipart uploads after a day:
-  a killed process leaves its in-flight upload behind.
+A destination is a store plus an optional `prefix`; files land at
+`<prefix>/<unit>/<path within the unit>`. Each verifies by `size` (the
+default) or `sha256`, and is `required` unless marked otherwise. An optional
+destination catches up later without holding registration back. No two
+destinations may share a prefix.
 
-## Registrars and notifiers
+- **S3:** `url: s3://bucket/prefix`, with `endpoint` for anything but AWS.
+  Credentials come from `options`, a `profile` or the `AWS_*` variables.
+  `bandwidth: 50MB` caps the rate, always or in a window
+  (`{"08:00-18:00": 50MB}`).
+- **Directories:** `url: /mnt/nas/raw`, or a UNC path.
 
-**Registrars** record complete units. An `exec` registrar is any command:
-ferry writes a versioned JSON event (`register`, `finalize`, `failures`) to its
-stdin, and exit code 0 means it was handled. Events go through a durable outbox
--- a catalog that is down delays registration but not uploads, delivery is
-at-least-once and in order per unit, and nothing is finalized until every
-`required` registrar has confirmed. The built-in `manifest` registrar writes
-`<unit>/_ferry_manifest.json` (every file's size, SHA-256 and copies) next to
-the data.
+For **Ceph RGW** and other self-hosted S3:
 
-**Notifiers** receive alerts: failures that keep recurring, units stuck open,
-and each pass's digest (as `info`, or `warning` if anything failed). With
-`events: [receipt]`, a notifier gets one receipt per unit once it is delivered
-instead: where each copy is, how it was verified, and whether the source files
-were kept, moved or deleted. Receipts wait in the outbox until they are taken.
-`webhook: URL` posts Slack-compatible text (or, with `format: event`, the event
-JSON); `exec:` runs a command with the event on stdin.
+- Path-style addressing, which RGW expects, is the default. Set `region` to
+  the zonegroup if RGW checks it.
+- Give each PC its own user, allowed `PutObject`, `GetObject` and
+  `ListBucket` on its prefixes. ferry never deletes from a store.
+- Add a lifecycle rule that aborts incomplete multipart uploads after a day.
+- Enable `checksum: sha256` only where the server validates it (RGW does from
+  Tentacle).
 
-[`docs/hooks.md`](docs/hooks.md) specifies the events, with an example hook.
+## Hooks: telling the rest of your stack
 
-## Operating it
+**Registrars** record complete units. A registrar is any command: ferry writes
+a JSON event to its stdin (`register`, `finalize` or `failures`), and exit
+code 0 means it was handled. Events wait in a durable outbox, so a catalog
+that is down delays registration but never uploads. Delivery is
+at-least-once and in order per unit, and each event carries an `id` for
+dropping repeats. The built-in `manifest` registrar writes
+`<unit>/_ferry_manifest.json` -- every file's size, SHA-256 and copies -- next
+to the data.
 
-- `ferry doctor` checks that a node can run -- its config, state and log
-  directories, the journal (a destination that moved, events waiting for a
-  registrar that is gone), each root, every store and every hook's program --
-  and exits 1 on anything that would stop ferry. `--write` also puts a probe
-  object in each store (`_ferry/doctor/<node>`) and reads it back; `--notify`
-  sends each notifier a test message.
-- `ferry status [--units] [--json]` shows units by state, the upload backlog,
-  and every failing copy or delivery with its last error.
-- `metrics: {listen: 127.0.0.1:9187}` (or `ferry watch --metrics ADDR`) serves
-  the same numbers to Prometheus at `/metrics` -- units by state, the backlog,
-  failing copies and deliveries, each pipeline's last pass, and transfers and
-  bytes by destination and outcome -- and `/healthz`, which answers 200 while
-  the journal does. Neither asks for credentials: keep them on localhost or a
-  management network. A node nothing can scrape can push a heartbeat instead
-  (`logs.ship.heartbeat`).
-- `ferry retry [-p PIPELINE] [-u UNIT]` clears retry backoff (and re-opens an
-  abandoned unit). Failures otherwise retry on their own with exponential
-  backoff (`retry.initial`, `retry.max`), and alert after `retry.alert_after`
-  attempts.
-- `ferry abandon PIPELINE UNIT` stops tracking a unit; its files stay where
-  they are.
-- `ferry destination accept PIPELINE DESTINATION` -- a destination's new
-  settings reach the same objects, so its copies keep counting -- or `ferry
-  destination reset PIPELINE DESTINATION` -- they do not, so every file not yet
-  finalized goes up again. ferry refuses to run until one is chosen; both take
-  `--dry-run`.
-- `ferry outbox discard PIPELINE REGISTRAR [--dry-run]` drops the undelivered
-  events of a registrar that was renamed or removed. ferry refuses to run while
-  any wait for one, rather than finalizing units it never registered.
-- Logs go to stderr and to `<state_dir>/logs/ferry.YYYY-MM-DD.jsonl` (UTC
-  days), one JSON object per line; `FERRY_LOG=debug` (any `tracing` filter)
-  overrides `logs.level`. With `logs.ship`, finished days are copied to a store,
-  `logs.ship.registrars` are told about each (and told again on the next round
-  if they failed), and a heartbeat object with every pipeline's summary is
-  refreshed.
-- `ferry service install` registers a native Windows service (delayed
-  automatic start, restarted on failure; run it as administrator, and pass
-  `--account` to run as a user that can reach network shares), a systemd unit
-  (`--system` for a system unit), or a launchd job on macOS (`--system`, with
-  sudo, for a daemon that starts at boot; otherwise an agent that starts when
-  you log in). `--account` runs a `--system` service as that user. `ferry
-  service print` shows the definition without installing it.
-- Keep a service's secrets in an env file, not in the config or the machine's
-  environment: `KEY=VALUE` lines that `--env-file PATH` (or `FERRY_ENV_FILE`)
-  sets before the config loads, so its `${VAR}`s, the `AWS_*` variables and
-  hooks all see them. `ferry --env-file PATH service install` makes the
-  service read it too. Only the account the service runs as should be able to
-  read the file:
-  - Linux and macOS: `chmod 600 ferry.env`, owned by that account (root for a
-    system service); ferry warns about a file others can read.
-  - Windows: `icacls C:\ProgramData\ferry\ferry.env /inheritance:r /grant:r
-    SYSTEM:R Administrators:F` (and grant the `--account`, if one is set).
+**Notifiers** send alerts -- failures that keep recurring, units stuck open,
+a digest per pass -- and, with `events: [receipt]`, one receipt per delivered
+unit. A `webhook` posts Slack-compatible text; an `exec` notifier gets the
+event JSON. A receipt reads:
+
+```text
+acquisition:
+• plateA__1 (384 files, 512.3 GB)
+copied to:
+• s3://instrument-raw/workcell/raw/plateA__1 (size verified)
+• s3://lab-archive/cytation5/plateA__1 (SHA-256 verified)
+registered with catalog · original moved to F:\Cytation5Raw\plateA__1
+workcell1-pc · workcell1_cytation · delivered 2h after its first file
+```
+
+[`docs/hooks.md`](https://github.com/Rosebud-Biosciences/ferry/blob/main/docs/hooks.md)
+specifies every event, shows an example hook, and explains how to start
+downstream work as soon as a unit lands.
+
+## Operating ferry
+
+### Commands
+
+| Command | What it does |
+| --- | --- |
+| `ferry status [--units] [--json]` | Units by state, the upload backlog, and each failure with its last error |
+| `ferry doctor [--write] [--notify]` | Checks the config, directories, journal, roots, stores and hooks; exits 1 if anything would stop ferry |
+| `ferry run [--dry-run]` | One pass over every pipeline, then exit -- for OS schedulers and testing |
+| `ferry retry [-p PIPELINE] [-u UNIT]` | Retries failures now (they also retry on their own, with backoff) and reopens abandoned units |
+| `ferry complete PIPELINE UNIT` | Treats an open unit as complete without waiting for it to go quiet |
+| `ferry abandon PIPELINE UNIT` | Stops tracking a unit; its files stay where they are |
+| `ferry destination accept\|reset PIPELINE DESTINATION` | Settles a destination that now points somewhere new: its copies still count, or go up again |
+| `ferry outbox discard PIPELINE REGISTRAR` | Drops the queued events of a registrar that was renamed or removed |
+| `ferry schedule` | When each cron pipeline runs next |
+| `ferry schema event\|manifest` | Prints the JSON Schema of what hooks receive |
+
+### Running as a service
+
+`ferry service install` hands `ferry watch` to the OS's service manager, which
+restarts it if it fails; `ferry service print` shows the definition first.
+
+- **Windows:** a native service, started at boot. Install it as
+  administrator; `--account` runs it as a user that can reach network shares.
+- **Linux:** a systemd user unit, or with `--system` a system unit.
+- **macOS:** a launchd agent that starts at login, or with `--system` (and
+  sudo) a daemon that starts at boot.
+
+### Secrets
+
+Keep credentials and webhook URLs out of the config, in an env file of
+`KEY=VALUE` lines that only the service's account can read: `chmod 600`, or
+on Windows `icacls FILE /inheritance:r /grant:r SYSTEM:R Administrators:F`
+(plus the `--account`, if you set one). Pass it as `--env-file PATH`. ferry
+loads it before the config, and `ferry --env-file PATH service install`
+makes the service load it too.
+
+### Monitoring
+
+- **Logs:** stderr, and `<state_dir>/logs/ferry.YYYY-MM-DD.jsonl` as JSON
+  lines; `FERRY_LOG=debug` adds detail.
+- **Metrics:** `metrics: {listen: 127.0.0.1:9187}` serves Prometheus
+  `/metrics` and `/healthz`, without authentication: keep it local.
+- **Heartbeat:** for a PC nothing can scrape, `logs.ship` copies finished
+  logs, and a summary of every pipeline, to a store.
+
+## Documentation
+
+- [Annotated configuration](https://github.com/Rosebud-Biosciences/ferry/blob/main/examples/ferry.example.yaml)
+  -- every option
+- [Hooks](https://github.com/Rosebud-Biosciences/ferry/blob/main/docs/hooks.md)
+  -- events, delivery, receipts and downstream work
+- [Design](https://github.com/Rosebud-Biosciences/ferry/blob/main/docs/design.md)
+  -- how ferry works, and why
+- [Changelog](https://github.com/Rosebud-Biosciences/ferry/blob/main/CHANGELOG.md)
 
 ## Compatibility
 
-Until 1.0, a minor release (`0.x`) may break any of the following, and the
-[changelog](CHANGELOG.md) says how; from 1.0, only a major release does. What
-releases keep stable:
+ferry follows semantic versioning; until 1.0, a minor release may break
+things, and the changelog says how. Releases keep these stable:
 
-- The command line: commands, flags and exit codes (0 success; 1 a pass with
-  failures, which are retried, or an operator command that could not act; 2
-  an error, such as a config that does not load).
-- The config format, version 1 (`version: 1`, optional). A config written
-  for a newer format is refused, never misread.
-- What hooks receive: events (`ferry.event/v1`) and manifests
-  (`ferry.manifest/v1`), with JSON Schemas in [`schemas/`](schemas). Fields
-  and event kinds are added without changing `schema`; a change that would
-  break a consumer that ignores what it does not know changes it.
-- The journal: a newer ferry upgrades it in place the first time it opens
-  it, and an older ferry refuses a journal a newer one upgraded.
+- **The command line:** commands, flags and exit codes: `0` success, `1`
+  failures that will be retried (or an operator command that could not act),
+  and `2` an error such as a config that does not load.
+- **The config format,** `version: 1`. A config written for a newer format
+  is refused, never misread.
+- **What hooks receive:** `ferry.event/v1` and `ferry.manifest/v1`
+  ([JSON Schemas](https://github.com/Rosebud-Biosciences/ferry/tree/main/schemas)).
+  Fields and event kinds may be added, so ignore what you do not recognize.
+- **The journal:** a newer ferry upgrades it in place; an older one refuses
+  it afterwards.
 
-The Rust library is ferry's internals, not an API, and is not published to
-crates.io.
+The Rust library is internal, not an API, and is not published to crates.io.
 
-## Development
+## Contributing
 
-```bash
-cargo fmt --check && cargo clippy --all-targets -- -D warnings
-cargo test
-```
-
-`FERRY_BLESS=1 cargo test --lib schemas` regenerates `schemas/` after a change
-to what hooks receive.
-
-The S3 tests run when `FERRY_TEST_S3_ENDPOINT` (plus `FERRY_TEST_S3_KEY`,
-`FERRY_TEST_S3_SECRET` and an existing `FERRY_TEST_S3_BUCKET`) points at an S3
-API, as CI does with SeaweedFS. [`docs/design.md`](docs/design.md) covers the
-architecture and the reasoning behind it.
-
-Contributions are welcome: [CONTRIBUTING.md](CONTRIBUTING.md) says how, and
-taking part means following the [Code of Conduct](CODE_OF_CONDUCT.md). Report
-security problems privately, as [SECURITY.md](SECURITY.md) describes.
+Contributions are welcome.
+[CONTRIBUTING.md](https://github.com/Rosebud-Biosciences/ferry/blob/main/CONTRIBUTING.md)
+covers building, testing and what a change needs, and everyone taking part
+follows the
+[Code of Conduct](https://github.com/Rosebud-Biosciences/ferry/blob/main/CODE_OF_CONDUCT.md).
+Please report security problems privately, as
+[SECURITY.md](https://github.com/Rosebud-Biosciences/ferry/blob/main/SECURITY.md)
+describes.
 
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE).
+[Apache-2.0](https://github.com/Rosebud-Biosciences/ferry/blob/main/LICENSE).
