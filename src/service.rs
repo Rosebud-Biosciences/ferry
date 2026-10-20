@@ -1,5 +1,6 @@
-//! Running `ferry watch` as a service: a native Windows service, or a systemd
-//! unit on Linux. Either starts at boot and restarts ferry if it exits.
+//! Running `ferry watch` as a service: a native Windows service, a systemd
+//! unit on Linux, or a launchd job on macOS. Each starts ferry at boot (or, as
+//! a user's service, at login) and restarts it if it exits.
 
 use std::path::{Path, PathBuf};
 
@@ -9,6 +10,7 @@ use anyhow::{Context, Result, bail};
 pub enum Platform {
     Windows,
     Systemd,
+    Launchd,
 }
 
 impl Platform {
@@ -17,6 +19,8 @@ impl Platform {
             Some(Self::Windows)
         } else if cfg!(target_os = "linux") {
             Some(Self::Systemd)
+        } else if cfg!(target_os = "macos") {
+            Some(Self::Launchd)
         } else {
             None
         }
@@ -31,10 +35,12 @@ pub struct ServiceSpec {
     pub config: PathBuf,
     /// Read into the environment first (`--env-file`): the service's secrets.
     pub env_file: Option<PathBuf>,
-    /// A system unit (Linux) rather than a user one. Windows services always
-    /// run system-wide, as LocalSystem unless `account` is given.
+    /// A system service (a systemd system unit, a launchd daemon) rather than
+    /// a user's. Windows services always run system-wide, as LocalSystem
+    /// unless `account` is given.
     pub system: bool,
-    /// Windows: the account the service logs on as (`.\user`, `DOMAIN\user`).
+    /// The account a system service runs as: on Windows the account it logs
+    /// on as (`.\user`, `DOMAIN\user`); elsewhere a user name (default root).
     pub account: Option<String>,
     pub password: Option<String>,
 }
@@ -88,6 +94,10 @@ pub fn systemd_unit(spec: &ServiceSpec) -> String {
     } else {
         "default.target"
     };
+    let user = match (&spec.account, spec.system) {
+        (Some(account), true) => format!("User={}\n", systemd_quote(account)),
+        _ => String::new(),
+    };
     format!(
         "[Unit]\n\
          Description=ferry edge ingest agent ({name})\n\
@@ -98,6 +108,7 @@ pub fn systemd_unit(spec: &ServiceSpec) -> String {
          Type=simple\n\
          ExecStart={exec}\n\
          WorkingDirectory={workdir}\n\
+         {user}\
          Restart=always\n\
          RestartSec=10\n\
          TimeoutStopSec=60\n\
@@ -106,6 +117,57 @@ pub fn systemd_unit(spec: &ServiceSpec) -> String {
          WantedBy={wanted_by}\n",
         name = spec.name,
         workdir = systemd_quote(&workdir.to_string_lossy()),
+    )
+}
+
+fn xml_escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// A launchd job: a daemon that starts at boot (`system`), or else an agent
+/// that starts when its user logs in. Either is restarted if it exits.
+pub fn launchd_plist(spec: &ServiceSpec) -> String {
+    let args: String = [spec.exe.to_string_lossy().into_owned(), "watch".into()]
+        .into_iter()
+        .chain(spec.config_args())
+        .map(|a| format!("    <string>{}</string>\n", xml_escape(&a)))
+        .collect();
+    let workdir = spec.config.parent().unwrap_or(Path::new("/"));
+    let user = match (&spec.account, spec.system) {
+        (Some(account), true) => format!("  <key>UserName</key>\n  <string>{}</string>\n", xml_escape(account)),
+        _ => String::new(),
+    };
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+         <plist version=\"1.0\">\n\
+         <dict>\n\
+         \x20 <key>Label</key>\n\
+         \x20 <string>{label}</string>\n\
+         \x20 <key>ProgramArguments</key>\n\
+         \x20 <array>\n\
+         {args}\
+         \x20 </array>\n\
+         \x20 <key>WorkingDirectory</key>\n\
+         \x20 <string>{workdir}</string>\n\
+         {user}\
+         \x20 <key>RunAtLoad</key>\n\
+         \x20 <true/>\n\
+         \x20 <key>KeepAlive</key>\n\
+         \x20 <true/>\n\
+         \x20 <key>ThrottleInterval</key>\n\
+         \x20 <integer>10</integer>\n\
+         \x20 <key>ExitTimeOut</key>\n\
+         \x20 <integer>60</integer>\n\
+         \x20 <key>ProcessType</key>\n\
+         \x20 <string>Background</string>\n\
+         </dict>\n\
+         </plist>\n",
+        label = xml_escape(&spec.name),
+        workdir = xml_escape(&workdir.to_string_lossy()),
     )
 }
 
@@ -168,7 +230,31 @@ pub fn render(spec: &ServiceSpec, platform: Platform) -> String {
     match platform {
         Platform::Windows => windows_commands(spec),
         Platform::Systemd => systemd_unit(spec),
+        Platform::Launchd => launchd_plist(spec),
     }
+}
+
+fn plist_path(name: &str, system: bool) -> Result<PathBuf> {
+    Ok(if system {
+        PathBuf::from("/Library/LaunchDaemons").join(format!("{name}.plist"))
+    } else {
+        dirs::home_dir()
+            .context("no home directory")?
+            .join("Library/LaunchAgents")
+            .join(format!("{name}.plist"))
+    })
+}
+
+/// The launchd domain a job goes in: `system`, or the user's GUI session.
+fn launchd_domain(system: bool) -> Result<String> {
+    if system {
+        return Ok("system".into());
+    }
+    let out = std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .context("cannot run `id -u`")?;
+    Ok(format!("gui/{}", String::from_utf8_lossy(&out.stdout).trim()))
 }
 
 fn systemctl(system: bool) -> std::process::Command {
@@ -219,9 +305,30 @@ pub fn install(spec: &ServiceSpec) -> Result<String> {
             };
             Ok(format!("Installed and started {}.{linger}", path.display()))
         }
+        Some(Platform::Launchd) => {
+            let path = plist_path(&spec.name, spec.system)?;
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&path, launchd_plist(spec)).with_context(|| format!("cannot write {}", path.display()))?;
+            let domain = launchd_domain(spec.system)?;
+            // An earlier install of the same job is replaced.
+            let _ = std::process::Command::new("launchctl")
+                .args(["bootout", &format!("{domain}/{}", spec.name)])
+                .output();
+            let mut bootstrap = std::process::Command::new("launchctl");
+            bootstrap.args(["bootstrap", &domain]).arg(&path);
+            run(bootstrap)?;
+            let when = if spec.system {
+                "at boot"
+            } else {
+                "when you log in (pass --system, with sudo, to start it at boot)"
+            };
+            Ok(format!("Installed and started {}; it starts {when}.", path.display()))
+        }
         Some(Platform::Windows) => windows::install(spec),
         None => bail!(
-            "ferry can install a service on Windows and on Linux (systemd); elsewhere, \
+            "ferry can install a service on Windows, Linux (systemd) and macOS (launchd); elsewhere, \
              run `ferry service print --platform systemd` and adapt it"
         ),
     }
@@ -241,6 +348,16 @@ pub fn uninstall(name: &str, system: bool) -> Result<String> {
             reload.arg("daemon-reload");
             run(reload)?;
             Ok(format!("Removed {}.", path.display()))
+        }
+        Some(Platform::Launchd) => {
+            let _ = std::process::Command::new("launchctl")
+                .args(["bootout", &format!("{}/{name}", launchd_domain(system)?)])
+                .output();
+            let path = plist_path(name, system)?;
+            if path.exists() {
+                std::fs::remove_file(&path)?;
+            }
+            Ok(format!("Stopped {name} and removed {}.", path.display()))
         }
         Some(Platform::Windows) => windows::uninstall(name),
         None => bail!("no service manager ferry knows how to use on this platform"),
@@ -432,6 +549,58 @@ mod tests {
         );
         assert!(unit.contains("Restart=always"));
         assert!(unit.contains("WantedBy=multi-user.target"));
+    }
+
+    #[test]
+    fn the_launchd_job_runs_watch_and_keeps_it_alive() {
+        let plist = launchd_plist(&ServiceSpec {
+            config: PathBuf::from("/Library/Application Support/ferry/R&D.yaml"),
+            account: Some("labdata".into()),
+            ..spec()
+        });
+        assert!(
+            plist.contains("  <key>Label</key>\n  <string>ferry</string>\n"),
+            "{plist}"
+        );
+        assert!(
+            plist.contains(
+                "    <string>/opt/ferry/bin/ferry</string>\n    <string>watch</string>\n    \
+                 <string>--config</string>\n    <string>/Library/Application Support/ferry/R&amp;D.yaml</string>\n  </array>"
+            ),
+            "{plist}"
+        );
+        assert!(
+            plist.contains("<key>UserName</key>\n  <string>labdata</string>"),
+            "{plist}"
+        );
+        assert!(plist.contains("<key>KeepAlive</key>\n  <true/>"), "{plist}");
+        if cfg!(target_os = "macos") {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("ferry.plist");
+            std::fs::write(&path, &plist).unwrap();
+            let lint = std::process::Command::new("plutil")
+                .arg("-lint")
+                .arg(&path)
+                .output()
+                .unwrap();
+            assert!(lint.status.success(), "{}", String::from_utf8_lossy(&lint.stdout));
+        }
+        let agent = launchd_plist(&ServiceSpec {
+            system: false,
+            account: Some("labdata".into()),
+            ..spec()
+        });
+        assert!(!agent.contains("UserName"), "an agent runs as its user");
+    }
+
+    #[test]
+    fn a_system_unit_can_run_as_an_account() {
+        let unit = systemd_unit(&ServiceSpec {
+            account: Some("ferry".into()),
+            ..spec()
+        });
+        assert!(unit.contains("WorkingDirectory=/etc/ferry\nUser=ferry\n"), "{unit}");
+        assert!(!systemd_unit(&spec()).contains("User="));
     }
 
     #[test]

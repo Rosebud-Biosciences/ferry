@@ -397,6 +397,17 @@ fn an_env_file_fills_in_the_config_and_goes_with_the_service() {
 }
 
 #[test]
+fn service_print_renders_a_launchd_job() {
+    let site = Site::new("", "");
+    ferry(&site.config)
+        .args(["service", "print", "--platform", "launchd", "--system"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("<string>watch</string>"))
+        .stdout(predicate::str::contains("<key>KeepAlive</key>"));
+}
+
+#[test]
 fn service_print_renders_a_systemd_unit() {
     let site = Site::new("", "");
     // systemd needs an argument with a backslash (any Windows path) quoted,

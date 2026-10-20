@@ -172,10 +172,12 @@ enum ServiceCommand {
         platform: Option<Platform>,
         #[arg(long, default_value = "ferry")]
         name: String,
-        /// A system-wide systemd unit rather than a user one.
+        /// A system service, started at boot (a systemd system unit, a
+        /// launchd daemon), rather than a user's.
         #[arg(long)]
         system: bool,
-        /// Windows: the account the service runs as (default LocalSystem).
+        /// The account it runs as: on Windows (default LocalSystem), or for a
+        /// --system service elsewhere (default root).
         #[arg(long)]
         account: Option<String>,
     },
@@ -731,7 +733,7 @@ fn service_command(config: &Path, env_file: Option<&Path>, command: ServiceComma
         } => {
             let platform = platform
                 .or_else(Platform::current)
-                .context("pick a --platform (windows or systemd)")?;
+                .context("pick a --platform (windows, systemd or launchd)")?;
             print!("{}", service::render(&spec(name, system, account, None)?, platform));
         }
         ServiceCommand::Install {

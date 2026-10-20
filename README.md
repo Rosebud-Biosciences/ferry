@@ -245,9 +245,11 @@ JSON); `exec:` runs a command with the event on stdin.
   refreshed.
 - `ferry service install` registers a native Windows service (delayed
   automatic start, restarted on failure; run it as administrator, and pass
-  `--account` to run as a user that can reach network shares) or a systemd unit
-  (`--system` for a system unit). `ferry service print` shows the definition
-  without installing it.
+  `--account` to run as a user that can reach network shares), a systemd unit
+  (`--system` for a system unit), or a launchd job on macOS (`--system`, with
+  sudo, for a daemon that starts at boot; otherwise an agent that starts when
+  you log in). `--account` runs a `--system` service as that user. `ferry
+  service print` shows the definition without installing it.
 - Keep a service's secrets in an env file, not in the config or the machine's
   environment: `KEY=VALUE` lines that `--env-file PATH` (or `FERRY_ENV_FILE`)
   sets before the config loads, so its `${VAR}`s, the `AWS_*` variables and
