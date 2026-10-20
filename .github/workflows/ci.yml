@@ -45,11 +45,17 @@ jobs:
       - run: cargo test --locked --no-fail-fast
 
   msrv:
-    # The declared rust-version builds.
+    # The declared rust-version builds. It is read from Cargo.toml rather than
+    # written as the action's ref (`@1.89`), which Dependabot mistakes for a
+    # version of the action and bumps.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.89
+      - id: msrv
+        run: echo "version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].rust_version')" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --locked
 
