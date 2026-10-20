@@ -97,6 +97,16 @@ enum Command {
     /// Check a configuration.
     #[command(subcommand)]
     Config(ConfigCommand),
+    /// Check that this node can run: its config, state, journal, roots,
+    /// stores and hooks. Exits 1 if anything would stop ferry.
+    Doctor {
+        /// Also put a probe object in each store and read it back.
+        #[arg(long)]
+        write: bool,
+        /// Also send each notifier a test message.
+        #[arg(long)]
+        notify: bool,
+    },
     /// Print the JSON Schema of the events hooks receive, or of the manifests
     /// the `manifest` registrar writes.
     Schema {
@@ -267,6 +277,11 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Command::Config(ConfigCommand::Validate) => validate(&load(&config)?),
+        Command::Doctor { write, notify } => crate::doctor::run(
+            &config,
+            env_file.as_deref(),
+            crate::doctor::DoctorOptions { write, notify },
+        ),
         Command::Schema { of } => {
             let name = match of {
                 SchemaOf::Event => "event.schema.json",
@@ -667,7 +682,7 @@ fn validate(cfg: &Config) -> Result<ExitCode> {
 }
 
 /// Where `program` would be found: a path (relative to `cwd`), or on PATH.
-fn find_program(program: &str, cwd: Option<&Path>) -> Option<PathBuf> {
+pub(crate) fn find_program(program: &str, cwd: Option<&Path>) -> Option<PathBuf> {
     let candidate = Path::new(program);
     let extensions: Vec<String> = if cfg!(windows) {
         std::env::var("PATHEXT")

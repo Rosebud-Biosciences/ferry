@@ -58,6 +58,72 @@ fn s3_config(h: &Harness, s3: &S3, prefix: &str, destinations: &str, extra: &str
     cfg
 }
 
+#[test]
+#[ignore = "needs an S3 endpoint: FERRY_TEST_S3_ENDPOINT"]
+fn doctor_reaches_the_bucket_and_says_when_one_is_missing() {
+    let s3 = require_s3!();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    let store = |bucket: &str| {
+        format!(
+            "{{url: 's3://{bucket}/{}', endpoint: '{}', region: us-east-1, allow_http: true, \
+             options: {{aws_access_key_id: '{}', aws_secret_access_key: '{}'}}}}",
+            run_prefix(),
+            s3.endpoint,
+            s3.key,
+            s3.secret
+        )
+    };
+    let config = |name: &str, destinations: &str| {
+        let path = dir.path().join(name);
+        std::fs::write(
+            &path,
+            format!(
+                "node: doctor-test\nstate_dir: state\nstores:\n  here: {}\n  gone: {}\n\
+                 pipelines:\n  - name: inst\n    root: src\n    destinations: {destinations}\n",
+                store(&s3.bucket),
+                store("ferry-test-no-such-bucket")
+            ),
+        )
+        .unwrap();
+        path
+    };
+    let doctor = |config: &std::path::Path, args: &[&str]| {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_ferry"))
+            .arg("--config")
+            .arg(config)
+            .arg("doctor")
+            .args(args)
+            .output()
+            .unwrap();
+        (out.status.code(), String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+    let line = |text: &str, start: &str| {
+        text.lines()
+            .find(|l| l.starts_with(start))
+            .unwrap_or_default()
+            .to_string()
+    };
+
+    let both = config("both.yaml", "[here, {store: gone, required: false}]");
+    let (code, text) = doctor(&both, &[]);
+    assert_eq!(code, Some(1), "{text}");
+    assert!(line(&text, "ok    inst/here ").ends_with(": reachable"), "{text}");
+    assert!(
+        text.contains("FAIL  inst/gone "),
+        "a missing bucket is not reachable: {text}"
+    );
+    // Writing to a missing bucket can create it (SeaweedFS does, for an
+    // admin), so only the bucket that exists gets a write probe.
+    let here = config("here.yaml", "[here]");
+    let (code, text) = doctor(&here, &["--write"]);
+    assert_eq!(code, Some(0), "{text}");
+    assert!(
+        line(&text, "ok    inst/here ").ends_with(": writes, and reads back what it wrote"),
+        "{text}"
+    );
+}
+
 async fn read(cfg: &ferry::config::Config, rel: &str) -> Vec<u8> {
     let store = ferry::stores::open_store("remote", &cfg.stores["remote"]).unwrap();
     let location = ferry::stores::Location::root(store);

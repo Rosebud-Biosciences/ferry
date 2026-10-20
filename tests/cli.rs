@@ -288,6 +288,11 @@ fn a_destination_that_moved_waits_for_an_operator() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("ferry destination accept inst remote"));
+    ferry(&site.config)
+        .arg("doctor")
+        .assert()
+        .code(1)
+        .stdout(predicate::str::contains("`ferry destination accept inst remote`"));
 
     ferry(&site.config)
         .args(["destination", "reset", "inst", "remote", "--dry-run"])
@@ -318,6 +323,41 @@ fn schedule_lists_the_next_passes_in_the_pipeline_zone() {
         lines[1].trim().ends_with("02:00 CET") || lines[1].trim().ends_with("02:00 CEST"),
         "{text}"
     );
+}
+
+#[test]
+fn doctor_says_what_would_stop_ferry() {
+    let site = Site::new(
+        "    registrars: [{name: catalog, exec: [ferry-test-no-such-hook]}]\n",
+        "",
+    );
+    ferry(&site.config)
+        .arg("doctor")
+        .assert()
+        .code(1)
+        .stdout(predicate::str::contains("ok    state dir "))
+        .stdout(predicate::str::contains("ok    inst/remote "))
+        .stdout(predicate::str::contains(
+            "FAIL  inst: registrar catalog: cannot find \"ferry-test-no-such-hook\"",
+        ))
+        .stdout(predicate::str::ends_with("1 problem(s) found\n"));
+    assert!(
+        files_under(&site.path("remote")).is_empty(),
+        "nothing written unless asked"
+    );
+}
+
+#[test]
+fn doctor_can_write_to_each_store() {
+    let site = Site::new("", "");
+    ferry(&site.config)
+        .args(["doctor", "--write"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("writes, and reads back what it wrote"))
+        .stdout(predicate::str::ends_with("no problems found\n"));
+    let probes: Vec<String> = files_under(&site.path("remote")).into_keys().collect();
+    assert_eq!(probes, ["_ferry/doctor/test-node"]);
 }
 
 #[test]

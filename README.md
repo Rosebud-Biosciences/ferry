@@ -59,6 +59,7 @@ pipelines:
 
 ```bash
 ferry config validate          # parse and check it; show where data goes
+ferry doctor --write           # can this node reach its stores and hooks?
 ferry run --dry-run            # what a pass would upload, register and finalize
 ferry run                      # one pass over every pipeline, then exit
 ferry watch                    # run until stopped (cron and stream pipelines)
@@ -214,6 +215,12 @@ JSON); `exec:` runs a command with the event on stdin.
 
 ## Operating it
 
+- `ferry doctor` checks that a node can run -- its config, state and log
+  directories, the journal (a destination that moved, events waiting for a
+  registrar that is gone), each root, every store and every hook's program --
+  and exits 1 on anything that would stop ferry. `--write` also puts a probe
+  object in each store (`_ferry/doctor/<node>`) and reads it back; `--notify`
+  sends each notifier a test message.
 - `ferry status [--units] [--json]` shows units by state, the upload backlog,
   and every failing copy or delivery with its last error.
 - `ferry retry [-p PIPELINE] [-u UNIT]` clears retry backoff (and re-opens an
