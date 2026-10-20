@@ -295,13 +295,21 @@ impl Notifier for WebhookNotifier {
     }
 
     async fn notify(&self, event: &Event) -> Result<()> {
-        self.client
+        let posted = self
+            .client
             .post(&self.url)
             .json(&webhook_body(self.format, event)?)
             .send()
-            .await?
-            .error_for_status()?;
-        Ok(())
+            .await
+            .and_then(reqwest::Response::error_for_status);
+        // A webhook's URL is often its credential: errors name only the host.
+        posted.map(drop).map_err(|e| {
+            let host = url::Url::parse(&self.url)
+                .ok()
+                .and_then(|u| u.host_str().map(str::to_string))
+                .unwrap_or_default();
+            anyhow!("{}: posting to {host}: {}", self.name, e.without_url())
+        })
     }
 }
 
@@ -496,6 +504,49 @@ mod notifier_tests {
 
         let register = Event::new(EventKind::Register, "pc1", Some("inst"));
         assert!(webhook_body(WebhookFormat::Text, &register).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_failing_webhook_never_shows_its_url() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream
+                    .write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await;
+            }
+        });
+        let mut alert = Event::new(EventKind::Alert, "pc1", None);
+        alert.alert = Some(Alert {
+            level: Level::Error,
+            title: "t".into(),
+            message: String::new(),
+            pipeline: None,
+            unit: None,
+        });
+        let refused = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        for (port, why) in [(port, "500"), (refused, "error sending request")] {
+            let url = format!("http://127.0.0.1:{port}/services/T0/B0/the-secret-part");
+            let notifier = WebhookNotifier::new(
+                "chat".into(),
+                url,
+                vec![NotifierEvent::Alert],
+                Level::Info,
+                WebhookFormat::Text,
+            );
+            let err = format!("{:#}", notifier.notify(&alert).await.unwrap_err());
+            assert!(err.starts_with("chat: posting to 127.0.0.1: "), "{err}");
+            assert!(err.contains(why), "{err}");
+            assert!(!err.contains("the-secret-part"), "{err}");
+        }
     }
 }
 
