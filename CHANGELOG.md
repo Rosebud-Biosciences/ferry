@@ -8,7 +8,7 @@ here.
 
 ## [Unreleased]
 
-## [0.1.0-alpha.1] - Unreleased
+## [0.1.0-alpha.1] - 2026-10-20
 
 The first release.
 
