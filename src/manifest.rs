@@ -330,7 +330,7 @@ mod tests {
                     verified: "size".into(),
                 },
             ],
-            registrars: vec!["rb_db".into()],
+            registrars: vec!["catalog".into()],
             original: Original {
                 action: action.into(),
                 done,
@@ -349,7 +349,7 @@ mod tests {
              copied to:\n\
              • s3://raw/workcell/plateA__1 (SHA-256 verified)\n\
              • file:///mnt/archive/plateA__1 (size verified)\n\
-             registered with rb_db · original deleted\n\
+             registered with catalog · original deleted\n\
              workcell1 · cytation · delivered 2h after its first file"
         );
     }
@@ -359,15 +359,15 @@ mod tests {
         let status = |r: Receipt| r.text("n", "p").lines().nth(5).unwrap().to_string();
         assert_eq!(
             status(receipt("move", true)),
-            "registered with rb_db · original moved to F:/Cytation5Raw/plateA__1"
+            "registered with catalog · original moved to F:/Cytation5Raw/plateA__1"
         );
         assert_eq!(
             status(receipt("move", false)),
-            "registered with rb_db · original moves to F:/Cytation5Raw/plateA__1 at 2026-10-16 10:16 UTC"
+            "registered with catalog · original moves to F:/Cytation5Raw/plateA__1 at 2026-10-16 10:16 UTC"
         );
         assert_eq!(
             status(receipt("delete", false)),
-            "registered with rb_db · original will be deleted at 2026-10-16 10:16 UTC"
+            "registered with catalog · original will be deleted at 2026-10-16 10:16 UTC"
         );
         let mut kept = receipt("keep", true);
         kept.registrars.clear();
