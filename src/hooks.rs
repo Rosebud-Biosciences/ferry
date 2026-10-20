@@ -499,19 +499,20 @@ mod notifier_tests {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
-    fn hook(script: &str, timeout: Duration) -> ExecHook {
+    /// A hook running `script` with `sh`, or with PowerShell on Windows.
+    fn hook(unix: &str, windows: &str, timeout: Duration) -> ExecHook {
         let env = BTreeMap::from([("EXTRA".to_string(), "x".to_string())]);
-        exec_hook(
-            "catalog".into(),
-            &["sh".into(), "-c".into(), script.into()],
-            &None,
-            &env,
-            timeout,
-        )
+        let argv = if cfg!(windows) {
+            vec!["powershell", "-NoProfile", "-NonInteractive", "-Command", windows]
+        } else {
+            vec!["sh", "-c", unix]
+        };
+        let argv: Vec<String> = argv.into_iter().map(String::from).collect();
+        exec_hook("catalog".into(), &argv, &None, &env, timeout)
     }
 
     fn event() -> Event {
@@ -522,11 +523,18 @@ mod tests {
     async fn the_event_arrives_on_stdin_with_its_kind_in_the_environment() {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("out");
-        let script = format!(
+        let unix = format!(
             "cat > '{0}'; echo >> '{0}'; echo \"$FERRY_EVENT $FERRY_NODE $FERRY_PIPELINE $EXTRA\" >> '{0}'",
             out.display()
         );
-        hook(&script, Duration::from_secs(10)).run(&event()).await.unwrap();
+        let windows = format!(
+            "[IO.File]::WriteAllText('{}', [Console]::In.ReadToEnd() + \"`n$env:FERRY_EVENT $env:FERRY_NODE $env:FERRY_PIPELINE $env:EXTRA`n\")",
+            out.display()
+        );
+        hook(&unix, &windows, Duration::from_secs(30))
+            .run(&event())
+            .await
+            .unwrap();
         let text = std::fs::read_to_string(&out).unwrap();
         let (json, env) = text.split_once('\n').unwrap();
         let received: Event = serde_json::from_str(json).unwrap();
@@ -539,18 +547,22 @@ mod tests {
 
     #[tokio::test]
     async fn a_failing_hook_reports_its_exit_code_and_the_end_of_stderr() {
-        let err = hook("echo 'catalog down' >&2; exit 3", Duration::from_secs(10))
-            .run(&event())
-            .await
-            .unwrap_err()
-            .to_string();
+        let err = hook(
+            "echo 'catalog down' >&2; exit 3",
+            "[Console]::Error.WriteLine('catalog down'); exit 3",
+            Duration::from_secs(30),
+        )
+        .run(&event())
+        .await
+        .unwrap_err()
+        .to_string();
         assert_eq!(err, "catalog: exit code 3 for register: catalog down");
     }
 
     #[tokio::test]
     async fn a_hung_hook_is_killed_at_its_timeout() {
         let started = std::time::Instant::now();
-        let err = hook("exec sleep 30", Duration::from_millis(300))
+        let err = hook("exec sleep 30", "Start-Sleep -Seconds 30", Duration::from_millis(300))
             .run(&event())
             .await
             .unwrap_err()
@@ -561,18 +573,26 @@ mod tests {
 
     #[tokio::test]
     async fn a_hook_may_ignore_its_input() {
-        hook("exit 0", Duration::from_secs(10)).run(&event()).await.unwrap();
+        hook("exit 0", "exit 0", Duration::from_secs(30))
+            .run(&event())
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
     async fn a_chatty_hook_costs_only_the_end_of_its_stderr() {
-        hook("head -c 20000000 /dev/zero; exit 0", Duration::from_secs(30))
-            .run(&event())
-            .await
-            .unwrap();
+        hook(
+            "head -c 20000000 /dev/zero; exit 0",
+            "[Console]::Out.Write('x' * 20000000); exit 0",
+            Duration::from_secs(60),
+        )
+        .run(&event())
+        .await
+        .unwrap();
         let err = hook(
             "i=0; while [ $i -lt 20000 ]; do echo \"noise $i\" >&2; i=$((i+1)); done; echo 'the real reason' >&2; exit 1",
-            Duration::from_secs(30),
+            "for ($i = 0; $i -lt 20000; $i++) { [Console]::Error.WriteLine(\"noise $i\") }; [Console]::Error.WriteLine('the real reason'); exit 1",
+            Duration::from_secs(60),
         )
         .run(&event())
         .await

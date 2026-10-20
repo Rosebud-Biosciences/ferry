@@ -620,7 +620,48 @@ mod tests {
         fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
+    /// Deny everyone the listing of `path`; `false` if this process lists it
+    /// anyway.
+    #[cfg(windows)]
+    fn lock_out(path: &Path) -> bool {
+        icacls(path, &["/deny", "*S-1-1-0:(RD)"]);
+        fs::read_dir(path).is_err()
+    }
+
+    #[cfg(windows)]
+    fn let_in(path: &Path) {
+        icacls(path, &["/remove:d", "*S-1-1-0"]);
+    }
+
+    #[cfg(windows)]
+    fn icacls(path: &Path, args: &[&str]) {
+        let path = path.to_string_lossy();
+        let out = std::process::Command::new("icacls")
+            .arg(path.strip_prefix(r"\\?\").unwrap_or(&path))
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "icacls {args:?}: {}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// Link `link` to the file `target`; `false` where this process may not
+    /// (Windows without the symlink privilege).
     #[cfg(unix)]
+    fn symlink(target: &Path, link: &Path) -> bool {
+        std::os::unix::fs::symlink(target, link).unwrap();
+        true
+    }
+
+    #[cfg(windows)]
+    fn symlink(target: &Path, link: &Path) -> bool {
+        std::os::windows::fs::symlink_file(target, link).is_ok()
+    }
+
     #[test]
     fn what_cannot_be_read_is_reported_where_it_is() {
         let dir = tempfile::tempdir().unwrap();
@@ -651,21 +692,25 @@ mod tests {
         let_in(&root);
         assert!(full.units.is_empty());
         assert!(full.errors[0].contains("cannot list"), "{:?}", full.errors);
-        assert!(
-            !scoped.units["u"].errors.is_empty(),
-            "a unit that cannot be looked at is not gone"
-        );
+        // Windows lets anyone reach into a folder they cannot list.
+        if cfg!(unix) {
+            assert!(
+                !scoped.units["u"].errors.is_empty(),
+                "a unit that cannot be looked at is not gone"
+            );
+        }
     }
 
-    #[cfg(unix)]
     #[test]
     fn symlinks_are_reported_not_followed() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("root");
         write(&dir.path().join("outside.tif"), b"not ours");
         write(&root.join("u/a.tif"), b"a");
-        std::os::unix::fs::symlink(dir.path().join("outside.tif"), root.join("u/link.tif")).unwrap();
-        std::os::unix::fs::symlink(dir.path().join("outside.tif"), root.join("v")).unwrap();
+        if !symlink(&dir.path().join("outside.tif"), &root.join("u/link.tif")) {
+            return;
+        }
+        symlink(&dir.path().join("outside.tif"), &root.join("v"));
 
         let scan = layout(&root, "").scan(None);
         assert_eq!(scan.units["u"].files.keys().collect::<Vec<_>>(), ["u/a.tif"]);
@@ -679,20 +724,28 @@ mod tests {
         assert!(excluded.units["u"].errors.is_empty() && excluded.errors.is_empty());
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     #[test]
     fn a_name_that_is_not_unicode_is_an_error() {
-        use std::os::unix::ffi::OsStrExt;
+        #[cfg(target_os = "linux")]
+        let bad = {
+            use std::os::unix::ffi::OsStrExt;
+            std::ffi::OsStr::from_bytes(b"bad\xff.tif").to_owned()
+        };
+        #[cfg(windows)]
+        let bad = {
+            use std::os::windows::ffi::OsStringExt;
+            std::ffi::OsString::from_wide(&[0x62, 0x61, 0x64, 0xD800, 0x2E, 0x74, 0x69, 0x66])
+        };
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         write(&root.join("u/a.tif"), b"a");
-        write(&root.join("u").join(std::ffi::OsStr::from_bytes(b"bad\xff.tif")), b"b");
+        write(&root.join("u").join(bad), b"b");
 
         let scan = layout(root, "").scan(None);
         assert!(scan.units["u"].errors[0].contains("not valid Unicode"));
     }
 
-    #[cfg(unix)]
     #[test]
     fn an_unread_directory_could_hold_any_regex_units_files() {
         let dir = tempfile::tempdir().unwrap();

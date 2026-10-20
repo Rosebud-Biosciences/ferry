@@ -122,11 +122,26 @@ fn status_before_any_run_says_so() {
         .stderr(predicate::str::contains("ferry has not run yet"));
 }
 
-#[cfg(unix)]
+/// An exec hook, as a YAML list, running `unix` with `sh` or `windows` with
+/// PowerShell. Both are YAML single-quoted: write `'` as `''`.
+fn shell(unix: &str, windows: &str) -> String {
+    if cfg!(windows) {
+        format!("[powershell, -NoProfile, -NonInteractive, -Command, '{windows}']")
+    } else {
+        format!("[sh, -c, '{unix}']")
+    }
+}
+
 #[test]
 fn a_run_ships_registers_with_the_exec_hook_and_finalizes() {
+    let hook = shell(
+        "cat >> events.jsonl; echo >> events.jsonl",
+        "[IO.File]::AppendAllText(''events.jsonl'', [Console]::In.ReadToEnd() + \"`n\")",
+    );
     let site = Site::new(
-        "    finalize: {action: delete}\n    registrars:\n      - {name: catalog, exec: [sh, -c, 'cat >> events.jsonl; echo >> events.jsonl'], cwd: .}\n",
+        &format!(
+            "    finalize: {{action: delete}}\n    registrars:\n      - {{name: catalog, exec: {hook}, cwd: .}}\n"
+        ),
         "",
     );
     write(&site.path("src/u__1/a.tif"), b"alpha");
@@ -153,11 +168,11 @@ fn a_run_ships_registers_with_the_exec_hook_and_finalizes() {
     assert_eq!(report["inst"]["units"]["finalized"], 1);
 }
 
-#[cfg(unix)]
 #[test]
 fn a_failing_hook_fails_the_run_and_shows_in_status() {
+    let hook = shell("echo down >&2; exit 4", "[Console]::Error.WriteLine(''down''); exit 4");
     let site = Site::new(
-        "    registrars:\n      - {name: catalog, exec: [sh, -c, 'echo down >&2; exit 4']}\n",
+        &format!("    registrars:\n      - {{name: catalog, exec: {hook}}}\n"),
         "",
     );
     write(&site.path("src/u__1/a.tif"), b"alpha");
