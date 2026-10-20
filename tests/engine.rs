@@ -1026,7 +1026,6 @@ async fn a_move_whose_source_vanished_needs_a_backup_that_matches() {
     assert_eq!(report.finalized, ["u__1"]);
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn a_unit_with_a_folder_it_cannot_read_waits_for_it() {
     let h = Harness::new();
@@ -1057,7 +1056,6 @@ async fn a_unit_with_a_folder_it_cannot_read_waits_for_it() {
     );
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn a_complete_unit_that_turns_unreadable_does_not_register() {
     let h = Harness::new();
@@ -1089,7 +1087,6 @@ async fn a_complete_unit_that_turns_unreadable_does_not_register() {
     );
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn a_registered_unit_that_turns_unreadable_is_not_finalized() {
     let h = Harness::new();
@@ -1117,7 +1114,6 @@ async fn a_registered_unit_that_turns_unreadable_is_not_finalized() {
     assert!(!h.src.join("u__1").exists());
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn a_root_that_cannot_be_listed_makes_nothing_gone() {
     let h = Harness::new();

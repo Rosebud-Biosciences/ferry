@@ -10,13 +10,14 @@ use chrono::Utc;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::{Config, Mode};
+use crate::config::{Config, Level, Mode};
 use crate::engine::{self, BoundRegistrar, Engine, EngineParts, PassReport};
 use crate::hooks::{Alerts, ExecHook, Notifier, Registrar, exec_hook, notifier_from, registrar_from};
 use crate::journal::{Binding, Journal};
 use crate::lock::StateLock;
 use crate::logs::{ship_logs, write_heartbeat};
-use crate::manifest::EventKind;
+use crate::manifest::{Alert, EventKind};
+use crate::metrics::Metrics;
 use crate::schedule::{Schedule, sleep_until};
 use crate::stores::{Location, Store, open_stores};
 use crate::stream::{self, StreamOptions};
@@ -217,6 +218,33 @@ impl Agent {
         let agent = self.clone();
         let stop2 = stop.clone();
         tasks.spawn(async move { agent.housekeeping(stop2).await });
+        if let Some(metrics) = &self.config.metrics {
+            match tokio::net::TcpListener::bind(&metrics.listen).await {
+                Ok(listener) => {
+                    tracing::info!("metrics at http://{}/metrics", metrics.listen);
+                    let pipelines = self
+                        .engines
+                        .iter()
+                        .map(|e| (e.name.clone(), e.cfg.destination_keys()))
+                        .collect();
+                    let served = Arc::new(Metrics::new(
+                        &self.config.node,
+                        pipelines,
+                        self.journal.clone(),
+                        crate::util::now_secs(),
+                    ));
+                    tasks.spawn(crate::metrics::serve(listener, served, stop.clone()));
+                }
+                // Data keeps moving without its metrics.
+                Err(e) => self.alerts.emit(Alert {
+                    level: Level::Error,
+                    title: format!("metrics: cannot listen on {}: {e}", metrics.listen),
+                    message: String::new(),
+                    pipeline: None,
+                    unit: None,
+                }),
+            }
+        }
         let modes: Vec<String> = self
             .engines
             .iter()

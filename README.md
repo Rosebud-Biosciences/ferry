@@ -28,6 +28,12 @@ uv tool install ferry-ingest          # or: pip install ferry-ingest (a prebuilt
 cargo install --locked --git https://github.com/Rosebud-Biosciences/ferry   # or build it from source
 ```
 
+Each [GitHub release](https://github.com/Rosebud-Biosciences/ferry/releases)
+also has a standalone `ferry` per platform -- the binary its wheel holds --
+and `SHA256SUMS`. Every file carries a build provenance attestation: `gh
+attestation verify FILE -R Rosebud-Biosciences/ferry` shows that this
+repository's release workflow built it.
+
 ## Quickstart
 
 ```yaml
@@ -59,6 +65,7 @@ pipelines:
 
 ```bash
 ferry config validate          # parse and check it; show where data goes
+ferry doctor --write           # can this node reach its stores and hooks?
 ferry run --dry-run            # what a pass would upload, register and finalize
 ferry run                      # one pass over every pipeline, then exit
 ferry watch                    # run until stopped (cron and stream pipelines)
@@ -214,8 +221,21 @@ JSON); `exec:` runs a command with the event on stdin.
 
 ## Operating it
 
+- `ferry doctor` checks that a node can run -- its config, state and log
+  directories, the journal (a destination that moved, events waiting for a
+  registrar that is gone), each root, every store and every hook's program --
+  and exits 1 on anything that would stop ferry. `--write` also puts a probe
+  object in each store (`_ferry/doctor/<node>`) and reads it back; `--notify`
+  sends each notifier a test message.
 - `ferry status [--units] [--json]` shows units by state, the upload backlog,
   and every failing copy or delivery with its last error.
+- `metrics: {listen: 127.0.0.1:9187}` (or `ferry watch --metrics ADDR`) serves
+  the same numbers to Prometheus at `/metrics` -- units by state, the backlog,
+  failing copies and deliveries, each pipeline's last pass, and transfers and
+  bytes by destination and outcome -- and `/healthz`, which answers 200 while
+  the journal does. Neither asks for credentials: keep them on localhost or a
+  management network. A node nothing can scrape can push a heartbeat instead
+  (`logs.ship.heartbeat`).
 - `ferry retry [-p PIPELINE] [-u UNIT]` clears retry backoff (and re-opens an
   abandoned unit). Failures otherwise retry on their own with exponential
   backoff (`retry.initial`, `retry.max`), and alert after `retry.alert_after`
@@ -238,9 +258,42 @@ JSON); `exec:` runs a command with the event on stdin.
   refreshed.
 - `ferry service install` registers a native Windows service (delayed
   automatic start, restarted on failure; run it as administrator, and pass
-  `--account` to run as a user that can reach network shares) or a systemd unit
-  (`--system` for a system unit). `ferry service print` shows the definition
-  without installing it.
+  `--account` to run as a user that can reach network shares), a systemd unit
+  (`--system` for a system unit), or a launchd job on macOS (`--system`, with
+  sudo, for a daemon that starts at boot; otherwise an agent that starts when
+  you log in). `--account` runs a `--system` service as that user. `ferry
+  service print` shows the definition without installing it.
+- Keep a service's secrets in an env file, not in the config or the machine's
+  environment: `KEY=VALUE` lines that `--env-file PATH` (or `FERRY_ENV_FILE`)
+  sets before the config loads, so its `${VAR}`s, the `AWS_*` variables and
+  hooks all see them. `ferry --env-file PATH service install` makes the
+  service read it too. Only the account the service runs as should be able to
+  read the file:
+  - Linux and macOS: `chmod 600 ferry.env`, owned by that account (root for a
+    system service); ferry warns about a file others can read.
+  - Windows: `icacls C:\ProgramData\ferry\ferry.env /inheritance:r /grant:r
+    SYSTEM:R Administrators:F` (and grant the `--account`, if one is set).
+
+## Compatibility
+
+Until 1.0, a minor release (`0.x`) may break any of the following, and the
+[changelog](CHANGELOG.md) says how; from 1.0, only a major release does. What
+releases keep stable:
+
+- The command line: commands, flags and exit codes (0 success; 1 a pass with
+  failures, which are retried, or an operator command that could not act; 2
+  an error, such as a config that does not load).
+- The config format, version 1 (`version: 1`, optional). A config written
+  for a newer format is refused, never misread.
+- What hooks receive: events (`ferry.event/v1`) and manifests
+  (`ferry.manifest/v1`), with JSON Schemas in [`schemas/`](schemas). Fields
+  and event kinds are added without changing `schema`; a change that would
+  break a consumer that ignores what it does not know changes it.
+- The journal: a newer ferry upgrades it in place the first time it opens
+  it, and an older ferry refuses a journal a newer one upgraded.
+
+The Rust library is ferry's internals, not an API, and is not published to
+crates.io.
 
 ## Development
 
@@ -249,10 +302,17 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
+`FERRY_BLESS=1 cargo test --lib schemas` regenerates `schemas/` after a change
+to what hooks receive.
+
 The S3 tests run when `FERRY_TEST_S3_ENDPOINT` (plus `FERRY_TEST_S3_KEY`,
 `FERRY_TEST_S3_SECRET` and an existing `FERRY_TEST_S3_BUCKET`) points at an S3
 API, as CI does with SeaweedFS. [`docs/design.md`](docs/design.md) covers the
 architecture and the reasoning behind it.
+
+Contributions are welcome: [CONTRIBUTING.md](CONTRIBUTING.md) says how, and
+taking part means following the [Code of Conduct](CODE_OF_CONDUCT.md). Report
+security problems privately, as [SECURITY.md](SECURITY.md) describes.
 
 ## License
 

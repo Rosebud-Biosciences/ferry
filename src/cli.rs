@@ -31,6 +31,10 @@ struct Cli {
     /// Config file.
     #[arg(short, long, env = "FERRY_CONFIG", default_value = "ferry.yaml", global = true)]
     config: PathBuf,
+    /// KEY=VALUE lines to set in the environment before anything else, such
+    /// as a service's credentials; they replace variables already set.
+    #[arg(long, env = "FERRY_ENV_FILE", global = true)]
+    env_file: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -55,6 +59,10 @@ enum Command {
     Watch {
         #[arg(short, long)]
         verbose: bool,
+        /// Serve /metrics and /healthz at this address and port (for example
+        /// 127.0.0.1:9187), instead of at `metrics.listen`.
+        #[arg(long, value_name = "ADDR")]
+        metrics: Option<String>,
     },
     /// What the journal knows: units by state, backlog and failures.
     Status {
@@ -93,6 +101,22 @@ enum Command {
     /// Check a configuration.
     #[command(subcommand)]
     Config(ConfigCommand),
+    /// Check that this node can run: its config, state, journal, roots,
+    /// stores and hooks. Exits 1 if anything would stop ferry.
+    Doctor {
+        /// Also put a probe object in each store and read it back.
+        #[arg(long)]
+        write: bool,
+        /// Also send each notifier a test message.
+        #[arg(long)]
+        notify: bool,
+    },
+    /// Print the JSON Schema of the events hooks receive, or of the manifests
+    /// the `manifest` registrar writes.
+    Schema {
+        #[arg(value_enum)]
+        of: SchemaOf,
+    },
     /// Run `ferry watch` as a service that starts at boot.
     #[command(subcommand)]
     Service(ServiceCommand),
@@ -137,6 +161,12 @@ enum ConfigCommand {
     Validate,
 }
 
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum SchemaOf {
+    Event,
+    Manifest,
+}
+
 #[derive(Subcommand)]
 enum ServiceCommand {
     /// Print the service definition `install` would register.
@@ -146,10 +176,12 @@ enum ServiceCommand {
         platform: Option<Platform>,
         #[arg(long, default_value = "ferry")]
         name: String,
-        /// A system-wide systemd unit rather than a user one.
+        /// A system service, started at boot (a systemd system unit, a
+        /// launchd daemon), rather than a user's.
         #[arg(long)]
         system: bool,
-        /// Windows: the account the service runs as (default LocalSystem).
+        /// The account it runs as: on Windows (default LocalSystem), or for a
+        /// --system service elsewhere (default root).
         #[arg(long)]
         account: Option<String>,
     },
@@ -192,14 +224,18 @@ pub fn main() -> ExitCode {
 
 fn dispatch(cli: Cli) -> Result<ExitCode> {
     let config = std::path::absolute(&cli.config)?;
+    let env_file = cli.env_file.as_deref().map(std::path::absolute).transpose()?;
+    if let Some(path) = &env_file {
+        load_env_file(path)?;
+    }
     match cli.command {
         Command::Run {
             pipelines,
             dry_run,
             verbose,
         } => run(&config, pipelines, dry_run, verbose),
-        Command::Watch { verbose } => {
-            serve_with(&config, CancellationToken::new(), true, verbose, true)?;
+        Command::Watch { verbose, metrics } => {
+            serve_with(&config, CancellationToken::new(), true, verbose, true, metrics)?;
             Ok(ExitCode::SUCCESS)
         }
         Command::Status { pipelines, units, json } => status(&config, pipelines, units, json),
@@ -247,13 +283,62 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Command::Config(ConfigCommand::Validate) => validate(&load(&config)?),
-        Command::Service(command) => service_command(&config, command),
+        Command::Doctor { write, notify } => crate::doctor::run(
+            &config,
+            env_file.as_deref(),
+            crate::doctor::DoctorOptions { write, notify },
+        ),
+        Command::Schema { of } => {
+            let name = match of {
+                SchemaOf::Event => "event.schema.json",
+                SchemaOf::Manifest => "manifest.schema.json",
+            };
+            let (_, schema) = crate::manifest::schemas()
+                .into_iter()
+                .find(|(file, _)| *file == name)
+                .context("no such schema")?;
+            println!("{}", serde_json::to_string_pretty(&schema)?);
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Service(command) => service_command(&config, env_file.as_deref(), command),
     }
 }
 
 fn fail(message: &str) -> Result<ExitCode> {
     eprintln!("{message}");
     Ok(ExitCode::from(1))
+}
+
+/// Set the variables in the env file `path`, warning if others can read it.
+fn load_env_file(path: &Path) -> Result<()> {
+    let text = std::fs::read_to_string(path).with_context(|| format!("cannot read env file {}", path.display()))?;
+    let vars = crate::util::parse_env_file(&text).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+    if let Some(warning) = exposure(path) {
+        eprintln!("warning: {warning}");
+    }
+    for (key, value) in vars {
+        // SAFETY: `dispatch` calls this before anything starts another thread.
+        unsafe { std::env::set_var(key, value) };
+    }
+    Ok(())
+}
+
+/// Why a file of secrets at `path` is readable by other users, if it is.
+pub fn exposure(path: &Path) -> Option<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path).ok()?.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Some(format!(
+                "{} can be read by other users (mode {mode:o}); `chmod 600` it",
+                path.display()
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    None
 }
 
 fn destination_command(cfg: &Config, command: DestinationCommand) -> Result<ExitCode> {
@@ -408,11 +493,22 @@ fn run(config: &Path, pipelines: Vec<String>, dry_run: bool, verbose: bool) -> R
 
 /// `ferry watch` until `stop` (the Windows service's entry point too).
 pub fn serve(config: &Path, stop: CancellationToken, console: bool) -> Result<()> {
-    serve_with(config, stop, console, false, false)
+    serve_with(config, stop, console, false, false, None)
 }
 
-fn serve_with(config: &Path, stop: CancellationToken, console: bool, verbose: bool, signals: bool) -> Result<()> {
-    let cfg = load(config)?;
+fn serve_with(
+    config: &Path,
+    stop: CancellationToken,
+    console: bool,
+    verbose: bool,
+    signals: bool,
+    metrics: Option<String>,
+) -> Result<()> {
+    let mut cfg = load(config)?;
+    if let Some(listen) = metrics {
+        crate::config::listen_address(&listen).context("--metrics")?;
+        cfg.metrics = Some(crate::config::MetricsConfig { listen });
+    }
     let _logs = logging(&cfg, verbose, console, true)?;
     runtime()?.block_on(async move {
         let agent = Arc::new(Agent::open(cfg, AgentOptions::default())?);
@@ -603,7 +699,7 @@ fn validate(cfg: &Config) -> Result<ExitCode> {
 }
 
 /// Where `program` would be found: a path (relative to `cwd`), or on PATH.
-fn find_program(program: &str, cwd: Option<&Path>) -> Option<PathBuf> {
+pub(crate) fn find_program(program: &str, cwd: Option<&Path>) -> Option<PathBuf> {
     let candidate = Path::new(program);
     let extensions: Vec<String> = if cfg!(windows) {
         std::env::var("PATHEXT")
@@ -631,12 +727,13 @@ fn find_program(program: &str, cwd: Option<&Path>) -> Option<PathBuf> {
     std::env::split_paths(&std::env::var_os("PATH")?).find_map(|dir| found(&dir.join(program)))
 }
 
-fn service_command(config: &Path, command: ServiceCommand) -> Result<ExitCode> {
+fn service_command(config: &Path, env_file: Option<&Path>, command: ServiceCommand) -> Result<ExitCode> {
     let spec = |name: String, system: bool, account: Option<String>, password: Option<String>| -> Result<ServiceSpec> {
         Ok(ServiceSpec {
             name,
             exe: std::env::current_exe()?,
             config: config.to_path_buf(),
+            env_file: env_file.map(Path::to_path_buf),
             system,
             account,
             password,
@@ -651,7 +748,7 @@ fn service_command(config: &Path, command: ServiceCommand) -> Result<ExitCode> {
         } => {
             let platform = platform
                 .or_else(Platform::current)
-                .context("pick a --platform (windows or systemd)")?;
+                .context("pick a --platform (windows, systemd or launchd)")?;
             print!("{}", service::render(&spec(name, system, account, None)?, platform));
         }
         ServiceCommand::Install {

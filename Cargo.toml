@@ -50,6 +50,7 @@ tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 url = "2"
 yaml_serde = "0.10"
+schemars = "1"
 
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.8"

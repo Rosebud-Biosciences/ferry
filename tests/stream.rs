@@ -228,6 +228,47 @@ async fn a_cron_pipeline_runs_passes_on_its_schedule_inside_watch() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn watch_serves_metrics_from_the_journal() {
+    async fn get(port: u16, path: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let Ok(mut stream) = tokio::net::TcpStream::connect(("127.0.0.1", port)).await else {
+            return String::new();
+        };
+        let request = format!("GET {path} HTTP/1.1\r\nHost: ferry\r\n\r\n");
+        let mut response = String::new();
+        if stream.write_all(request.as_bytes()).await.is_ok() {
+            let _ = stream.read_to_string(&mut response).await;
+        }
+        response
+    }
+
+    let h = Harness::new();
+    let mut cfg = h.config("");
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    cfg.metrics = Some(ferry::config::MetricsConfig {
+        listen: format!("127.0.0.1:{port}"),
+    });
+    write(&h.src.join("u__1/a.tif"), b"alpha");
+    let watching = Watching::start(&h, &cfg);
+
+    let uploaded = "ferry_transfers_total{pipeline=\"inst\",destination=\"remote\",op=\"upload\",status=\"ok\"} 1\n";
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut body = get(port, "/metrics").await;
+    while !body.contains(uploaded) && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        body = get(port, "/metrics").await;
+    }
+    assert!(body.contains(uploaded), "{body}");
+    assert!(body.contains("ferry_pending_files{pipeline=\"inst\"} 0\n"), "{body}");
+    assert!(get(port, "/healthz").await.ends_with("\r\n\r\nok\n"));
+    watching.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stopping_lets_the_daemon_exit_promptly() {
     let h = Harness::new();
     let cfg = h.config("    poll_interval: 10m\n    full_scan_interval: 10m\n");

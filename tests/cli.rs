@@ -13,6 +13,7 @@ fn ferry(config: &Path) -> Command {
     cmd.arg("--config")
         .arg(config)
         .env_remove("FERRY_CONFIG")
+        .env_remove("FERRY_ENV_FILE")
         .env("FERRY_LOG", "warn");
     cmd
 }
@@ -76,6 +77,18 @@ fn version() {
 }
 
 #[test]
+fn schemas_print_without_a_config() {
+    let out = Command::new(env!("CARGO_BIN_EXE_ferry"))
+        .args(["schema", "event"])
+        .env_remove("FERRY_CONFIG")
+        .assert()
+        .success();
+    let schema: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(schema["properties"]["schema"]["const"], "ferry.event/v1");
+    assert!(schema["required"].as_array().unwrap().contains(&"id".into()));
+}
+
+#[test]
 fn validate_shows_where_each_pipeline_sends_data() {
     let site = Site::new("    finalize: {action: delete}\n", "");
     ferry(&site.config)
@@ -122,11 +135,26 @@ fn status_before_any_run_says_so() {
         .stderr(predicate::str::contains("ferry has not run yet"));
 }
 
-#[cfg(unix)]
+/// An exec hook, as a YAML list, running `unix` with `sh` or `windows` with
+/// PowerShell. Both are YAML single-quoted: write `'` as `''`.
+fn shell(unix: &str, windows: &str) -> String {
+    if cfg!(windows) {
+        format!("[powershell, -NoProfile, -NonInteractive, -Command, '{windows}']")
+    } else {
+        format!("[sh, -c, '{unix}']")
+    }
+}
+
 #[test]
 fn a_run_ships_registers_with_the_exec_hook_and_finalizes() {
+    let hook = shell(
+        "cat >> events.jsonl; echo >> events.jsonl",
+        "[IO.File]::AppendAllText(''events.jsonl'', [Console]::In.ReadToEnd() + \"`n\")",
+    );
     let site = Site::new(
-        "    finalize: {action: delete}\n    registrars:\n      - {name: catalog, exec: [sh, -c, 'cat >> events.jsonl; echo >> events.jsonl'], cwd: .}\n",
+        &format!(
+            "    finalize: {{action: delete}}\n    registrars:\n      - {{name: catalog, exec: {hook}, cwd: .}}\n"
+        ),
         "",
     );
     write(&site.path("src/u__1/a.tif"), b"alpha");
@@ -153,11 +181,11 @@ fn a_run_ships_registers_with_the_exec_hook_and_finalizes() {
     assert_eq!(report["inst"]["units"]["finalized"], 1);
 }
 
-#[cfg(unix)]
 #[test]
 fn a_failing_hook_fails_the_run_and_shows_in_status() {
+    let hook = shell("echo down >&2; exit 4", "[Console]::Error.WriteLine(''down''); exit 4");
     let site = Site::new(
-        "    registrars:\n      - {name: catalog, exec: [sh, -c, 'echo down >&2; exit 4']}\n",
+        &format!("    registrars:\n      - {{name: catalog, exec: {hook}}}\n"),
         "",
     );
     write(&site.path("src/u__1/a.tif"), b"alpha");
@@ -260,6 +288,11 @@ fn a_destination_that_moved_waits_for_an_operator() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("ferry destination accept inst remote"));
+    ferry(&site.config)
+        .arg("doctor")
+        .assert()
+        .code(1)
+        .stdout(predicate::str::contains("`ferry destination accept inst remote`"));
 
     ferry(&site.config)
         .args(["destination", "reset", "inst", "remote", "--dry-run"])
@@ -290,6 +323,88 @@ fn schedule_lists_the_next_passes_in_the_pipeline_zone() {
         lines[1].trim().ends_with("02:00 CET") || lines[1].trim().ends_with("02:00 CEST"),
         "{text}"
     );
+}
+
+#[test]
+fn doctor_says_what_would_stop_ferry() {
+    let site = Site::new(
+        "    registrars: [{name: catalog, exec: [ferry-test-no-such-hook]}]\n",
+        "",
+    );
+    ferry(&site.config)
+        .arg("doctor")
+        .assert()
+        .code(1)
+        .stdout(predicate::str::contains("ok    state dir "))
+        .stdout(predicate::str::contains("ok    inst/remote "))
+        .stdout(predicate::str::contains(
+            "FAIL  inst: registrar catalog: cannot find \"ferry-test-no-such-hook\"",
+        ))
+        .stdout(predicate::str::ends_with("1 problem(s) found\n"));
+    assert!(
+        files_under(&site.path("remote")).is_empty(),
+        "nothing written unless asked"
+    );
+}
+
+#[test]
+fn doctor_can_write_to_each_store() {
+    let site = Site::new("", "");
+    ferry(&site.config)
+        .args(["doctor", "--write"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("writes, and reads back what it wrote"))
+        .stdout(predicate::str::ends_with("no problems found\n"));
+    let probes: Vec<String> = files_under(&site.path("remote")).into_keys().collect();
+    assert_eq!(probes, ["_ferry/doctor/test-node"]);
+}
+
+#[test]
+fn an_env_file_fills_in_the_config_and_goes_with_the_service() {
+    let site = Site::new("", "");
+    let text = std::fs::read_to_string(&site.config)
+        .unwrap()
+        .replace("node: test-node", "node: ${FERRY_TEST_NODE}");
+    std::fs::write(&site.config, text).unwrap();
+    let env = site.path("ferry.env");
+    std::fs::write(&env, "# the service's secrets\nFERRY_TEST_NODE=from-the-env-file\n").unwrap();
+
+    let validated = ferry(&site.config)
+        .arg("--env-file")
+        .arg(&env)
+        .args(["config", "validate"])
+        .assert()
+        .success()
+        .stdout(predicate::str::starts_with("node from-the-env-file;"));
+    if cfg!(unix) {
+        validated.stderr(predicate::str::contains("`chmod 600` it"));
+    }
+    ferry(&site.config)
+        .arg("--env-file")
+        .arg(&env)
+        .args(["service", "print", "--platform", "systemd"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(" --env-file "));
+    ferry(&site.config)
+        .arg("--env-file")
+        .arg(site.path("missing.env"))
+        .args(["config", "validate"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("cannot read env file"));
+}
+
+#[test]
+fn service_print_renders_a_launchd_job() {
+    let site = Site::new("", "");
+    ferry(&site.config)
+        .args(["service", "print", "--platform", "launchd", "--system"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("<string>watch</string>"))
+        .stdout(predicate::str::contains("<key>KeepAlive</key>"));
 }
 
 #[test]

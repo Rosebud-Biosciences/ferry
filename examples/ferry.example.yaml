@@ -2,6 +2,7 @@
 # this file's directory; ${VAR} and ${VAR:-default} are read from the
 # environment (quote them inside {...} flow mappings).
 
+version: 1                        # the config format; optional
 node: workcell1-pc                # default: the hostname
 state_dir: C:/ProgramData/ferry   # journal, logs and lock live here
 
@@ -105,6 +106,9 @@ logs:
     registrars:                    # told about each shipped day (event: log)
       - exec: [python, -m, my_catalog.ferry_hook]
         cwd: C:/ferry-hooks
+
+metrics:                           # Prometheus /metrics and /healthz, in `ferry watch`
+  listen: 127.0.0.1:9187           # no authentication: keep it local or on a management network
 
 notifiers:
   - webhook: ${FERRY_ALERT_WEBHOOK}   # Slack-compatible incoming webhook

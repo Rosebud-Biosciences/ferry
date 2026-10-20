@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_call: # the release runs it first
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -102,3 +103,10 @@ jobs:
           python3 -m venv /tmp/venv
           /tmp/venv/bin/pip install dist/*.whl
           /tmp/venv/bin/ferry --version
+      - name: The release unpacks it into a standalone binary
+        run: |
+          mkdir -p wheels/wheel-x86_64-unknown-linux-gnu
+          cp dist/*.whl wheels/wheel-x86_64-unknown-linux-gnu/
+          python3 .github/scripts/package_binaries.py 0.0.0-test wheels binaries
+          tar -xzf binaries/ferry-0.0.0-test-x86_64-unknown-linux-gnu.tar.gz
+          ferry-0.0.0-test-x86_64-unknown-linux-gnu/ferry --version

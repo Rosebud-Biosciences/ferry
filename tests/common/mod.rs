@@ -349,6 +349,35 @@ pub fn let_in(path: &Path) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
+/// Deny everyone the listing of the directory `path`; `false` if this
+/// process lists it anyway, so the caller can skip.
+#[cfg(windows)]
+pub fn lock_out(path: &Path) -> bool {
+    icacls(path, &["/deny", "*S-1-1-0:(RD)"]);
+    std::fs::read_dir(path).is_err()
+}
+
+#[cfg(windows)]
+pub fn let_in(path: &Path) {
+    icacls(path, &["/remove:d", "*S-1-1-0"]);
+}
+
+#[cfg(windows)]
+fn icacls(path: &Path, args: &[&str]) {
+    let path = path.to_string_lossy();
+    let out = std::process::Command::new("icacls")
+        .arg(path.strip_prefix(r"\\?\").unwrap_or(&path))
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "icacls {args:?}: {}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// Backdate every file and directory under (and including) `top`.
 pub fn age_tree(top: &Path, mtime: f64) {
     for entry in walk(top) {

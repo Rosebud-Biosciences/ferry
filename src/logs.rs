@@ -22,7 +22,7 @@ use tracing_subscriber::{EnvFilter, Layer, fmt};
 
 use crate::hooks::ExecHook;
 use crate::journal::Journal;
-use crate::manifest::{Event, EventKind, ShippedLog};
+use crate::manifest::{Event, EventKind, ShippedLog, log_event_id};
 use crate::stores::Location;
 use crate::util::{iso, now_secs};
 
@@ -164,15 +164,17 @@ pub async fn ship_logs(
             .and_then(|n| n.strip_suffix(".jsonl"))
             .unwrap_or_default()
             .to_string();
-        let mut event = Event::new(EventKind::Log, node, None);
-        event.log = Some(ShippedLog {
+        let log = ShippedLog {
             node: node.to_string(),
             name: row.name.clone(),
             day,
             uri: row.uri,
             size: row.size,
             sha256: row.sha256,
-        });
+        };
+        let mut event = Event::new(EventKind::Log, node, None);
+        event.id = log_event_id(&log);
+        event.log = Some(log);
         let result = hook.run(&event).await;
         if let Ok(j) = journal.lock() {
             let recorded = match &result {
@@ -338,7 +340,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn a_log_registrar_that_was_down_hears_about_it_next_round() {
         let logs = tempfile::tempdir().unwrap();
@@ -348,26 +349,37 @@ mod tests {
         let location = local(remote.path()).child("logs").unwrap();
         let today = NaiveDate::from_ymd_opt(2026, 10, 8).unwrap();
         let calls = logs.path().join("calls");
-        let catalog = |script: &str| {
-            crate::hooks::exec_hook(
-                "catalog".into(),
-                &[
+        let catalog = |code: i32| {
+            let argv: Vec<String> = if cfg!(windows) {
+                vec![
+                    "powershell".into(),
+                    "-NoProfile".into(),
+                    "-NonInteractive".into(),
+                    "-Command".into(),
+                    format!("[IO.File]::AppendAllText('{}', \"x`n\"); exit {code}", calls.display()),
+                ]
+            } else {
+                vec![
                     "sh".into(),
                     "-c".into(),
-                    format!("echo x >> '{}'; {script}", calls.display()),
-                ],
+                    format!("echo x >> '{}'; exit {code}", calls.display()),
+                ]
+            };
+            crate::hooks::exec_hook(
+                "catalog".into(),
+                &argv,
                 &None,
                 &Default::default(),
-                std::time::Duration::from_secs(10),
+                std::time::Duration::from_secs(30),
             )
         };
         let count = || std::fs::read_to_string(&calls).unwrap_or_default().lines().count();
 
-        ship_logs(&journal, &location, logs.path(), "pc1", &[catalog("exit 1")], today).await;
+        ship_logs(&journal, &location, logs.path(), "pc1", &[catalog(1)], today).await;
         assert_eq!(count(), 1);
-        ship_logs(&journal, &location, logs.path(), "pc1", &[catalog("exit 0")], today).await;
+        ship_logs(&journal, &location, logs.path(), "pc1", &[catalog(0)], today).await;
         assert_eq!(count(), 2, "told again after failing");
-        ship_logs(&journal, &location, logs.path(), "pc1", &[catalog("exit 0")], today).await;
+        ship_logs(&journal, &location, logs.path(), "pc1", &[catalog(0)], today).await;
         assert_eq!(count(), 2, "and only until it took it");
     }
 }

@@ -1,0 +1,21 @@
+name: Feature request
+description: Something ferry should do that it does not.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What you are trying to do, and where ferry gets in the way. Your instruments, data and stores help.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would help
+      description: How you would like it to work. A config sketch is welcome.
+  - type: textarea
+    id: instead
+    attributes:
+      label: What you do now
+      description: Workarounds or other tools you have tried.

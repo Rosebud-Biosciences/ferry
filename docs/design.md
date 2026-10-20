@@ -279,13 +279,25 @@ grace period and is then cut off, to be retried by the next run.
 
 Logs are JSON lines, one file per UTC day, so a finished day is a finished
 file. Shipping copies finished days to a store and runs the log registrars,
-and a heartbeat object records each pipeline's summary. On Windows, `ferry
-service install` registers a native service with the service manager: delayed
-automatic start, restart actions on any failure (crash or error exit), stop and
-shutdown handled as a graceful stop. On Linux it installs a systemd unit.
+and a heartbeat object records each pipeline's summary: a push, for nodes
+nothing can reach. For those something can, `ferry watch` serves the same
+numbers as Prometheus metrics, read from the journal on each scrape, so they
+agree with `ferry status`; transfer counters total the journal's transfers,
+which are never deleted, and each scrape reads only those since the last.
+
+On Windows, `ferry service install` registers a native service with the
+service manager: delayed automatic start, restart actions on any failure (crash
+or error exit), stop and shutdown handled as a graceful stop. On Linux it
+installs a systemd unit, on macOS a launchd job. A service reads its secrets
+from an `--env-file` before its config loads, so neither the config nor the
+machine's environment holds them.
+
+`ferry doctor` reads what `ferry run` would refuse to start over -- a
+destination that moved, events for a registrar that is gone -- without
+changing the journal, and reaches every store and hook the config names.
 
 ## Not (yet) here
 
-Prometheus metrics; registration driven by bucket notifications on the
-manifest object; STS / web-identity credentials; an OpenLineage registrar;
-self-update; fleet-wide configuration.
+Registration driven by bucket notifications on the manifest object; STS /
+web-identity credentials; an OpenLineage registrar; self-update; fleet-wide
+configuration.
