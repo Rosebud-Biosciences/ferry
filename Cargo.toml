@@ -51,6 +51,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"]
 url = "2"
 yaml_serde = "0.10"
 schemars = "1"
+parking_lot = "0.12"
 
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.8"

@@ -8,10 +8,11 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
+use parking_lot::{Mutex, MutexGuard};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
@@ -56,13 +57,13 @@ impl Metrics {
         }
     }
 
-    fn journal(&self) -> Result<std::sync::MutexGuard<'_, Journal>> {
-        self.journal.lock().map_err(|_| anyhow!("the journal lock is poisoned"))
+    fn journal(&self) -> MutexGuard<'_, Journal> {
+        self.journal.lock()
     }
 
     /// The journal answers.
     pub fn healthy(&self) -> Result<()> {
-        self.journal()?.get_meta("schema_version")?;
+        self.journal().get_meta("schema_version")?;
         Ok(())
     }
 
@@ -77,7 +78,7 @@ impl Metrics {
         );
         out.sample("ferry_start_time_seconds", &[], self.started);
 
-        let journal = self.journal()?;
+        let journal = self.journal();
         let mut summaries = Vec::new();
         for (name, dests) in &self.pipelines {
             summaries.push((name, journal.summary(name, dests)?));
@@ -130,7 +131,7 @@ impl Metrics {
             }
         }
 
-        let mut counted = self.transfers.lock().map_err(|_| anyhow!("metrics lock poisoned"))?;
+        let mut counted = self.transfers.lock();
         let (new, last) = journal.transfer_totals(counted.last)?;
         for t in new {
             let entry = counted.totals.entry((t.pipeline, t.dest, t.op, t.status)).or_default();
@@ -293,8 +294,8 @@ mod tests {
     #[test]
     fn counters_add_up_across_scrapes() {
         let m = metrics();
-        upload(&m.journal().unwrap(), "inst", "ceph", "ok", 100);
-        upload(&m.journal().unwrap(), "inst", "ceph", "failed", 0);
+        upload(&m.journal(), "inst", "ceph", "ok", 100);
+        upload(&m.journal(), "inst", "ceph", "failed", 0);
         let first = m.render().unwrap();
         assert!(first.contains("ferry_build_info{version=\""), "{first}");
         assert!(first.contains("ferry_start_time_seconds 1700000000.5\n"), "{first}");
@@ -310,7 +311,7 @@ mod tests {
             "{first}"
         );
 
-        upload(&m.journal().unwrap(), "inst", "ceph", "ok", 50);
+        upload(&m.journal(), "inst", "ceph", "ok", 50);
         let second = m.render().unwrap();
         assert!(
             second.contains(

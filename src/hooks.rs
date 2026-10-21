@@ -12,12 +12,13 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use object_store::{ObjectStoreExt, PutPayload};
+use parking_lot::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// How much of a hook's stderr is kept (its end); errors show the last 2000
@@ -409,7 +410,8 @@ impl Alerts {
             Level::Warning => tracing::warn!(pipeline, unit, alert = true, "{}", alert.text()),
             Level::Error => tracing::error!(pipeline, unit, alert = true, "{}", alert.text()),
         }
-        if let Ok(mut sent) = self.sent.lock() {
+        {
+            let mut sent = self.sent.lock();
             if sent.len() >= SENT_KEPT {
                 sent.drain(..SENT_KEPT / 2);
             }
@@ -428,24 +430,19 @@ impl Alerts {
                     tracing::warn!("notifier failed: {e:#}");
                 }
             });
-            if let Ok(mut pending) = self.pending.lock() {
-                pending.retain(|h| !h.is_finished());
-                pending.push(handle);
-            }
+            let mut pending = self.pending.lock();
+            pending.retain(|h| !h.is_finished());
+            pending.push(handle);
         }
     }
 
     pub fn sent(&self) -> Vec<Alert> {
-        self.sent.lock().map(|s| s.clone()).unwrap_or_default()
+        self.sent.lock().clone()
     }
 
     /// Wait (briefly) for alerts still being delivered.
     pub async fn close(&self) {
-        let handles: Vec<_> = self
-            .pending
-            .lock()
-            .map(|mut p| p.drain(..).collect())
-            .unwrap_or_default();
+        let handles: Vec<_> = self.pending.lock().drain(..).collect();
         let _ = tokio::time::timeout(Duration::from_secs(15), futures::future::join_all(handles)).await;
     }
 }

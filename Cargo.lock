@@ -596,6 +596,7 @@ dependencies = [
  "humantime",
  "notify",
  "object_store",
+ "parking_lot",
  "predicates",
  "regex",
  "reqwest",

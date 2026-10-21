@@ -21,12 +21,13 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 use futures::StreamExt;
 use futures::future::join_all;
 use object_store::{ObjectStore, ObjectStoreExt};
+use parking_lot::{Mutex, MutexGuard};
 use rusqlite::types::Value;
 use serde::Serialize;
 use tokio::sync::Semaphore;
@@ -268,7 +269,7 @@ impl Engine {
             .map(|d| d.key.clone())
             .collect();
         {
-            let mut journal = parts.journal.lock().map_err(|_| anyhow!("journal lock poisoned"))?;
+            let mut journal = parts.journal.lock();
             let moved = journal.bind_destinations(&parts.cfg.name, &parts.bindings, &all_keys)?;
             if !moved.is_empty() {
                 let pipeline = &parts.cfg.name;
@@ -330,7 +331,7 @@ impl Engine {
 
     // -- helpers ------------------------------------------------------------
     pub fn db(&self) -> MutexGuard<'_, Journal> {
-        self.journal.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.journal.lock()
     }
 
     fn now(&self) -> f64 {
@@ -349,9 +350,7 @@ impl Engine {
     }
 
     fn report<F: FnOnce(&mut PassReport)>(&self, f: F) {
-        if let Ok(mut report) = self.report.lock() {
-            f(&mut report);
-        }
+        f(&mut self.report.lock());
     }
 
     fn live(&self, unit_id: i64) -> Result<Vec<FileRow>> {
@@ -374,11 +373,7 @@ impl Engine {
     pub fn take_report(&self) -> PassReport {
         let now = self.now();
         let waiting = self.waiting().unwrap_or_default();
-        let mut report = self
-            .report
-            .lock()
-            .map(|mut r| std::mem::replace(&mut *r, PassReport::new(&self.name, now)))
-            .unwrap_or_else(|_| PassReport::new(&self.name, now));
+        let mut report = std::mem::replace(&mut *self.report.lock(), PassReport::new(&self.name, now));
         report.finished = Some(now);
         report.waiting = waiting;
         report
