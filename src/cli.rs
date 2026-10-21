@@ -235,7 +235,13 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             verbose,
         } => run(&config, pipelines, dry_run, verbose),
         Command::Watch { verbose, metrics } => {
-            serve_with(&config, CancellationToken::new(), true, verbose, true, metrics)?;
+            let options = WatchOptions {
+                console: true,
+                verbose,
+                signals: true,
+                metrics,
+            };
+            serve_with(&config, CancellationToken::new(), options)?;
             Ok(ExitCode::SUCCESS)
         }
         Command::Status { pipelines, units, json } => status(&config, pipelines, units, json),
@@ -412,13 +418,21 @@ fn runtime() -> Result<tokio::runtime::Runtime> {
     Ok(tokio::runtime::Builder::new_multi_thread().enable_all().build()?)
 }
 
-fn logging(cfg: &Config, verbose: bool, console: bool, files: bool) -> Result<LogGuard> {
+/// Where a command logs.
+struct LogTo {
+    /// stderr.
+    console: bool,
+    /// The daily files in the log directory.
+    files: bool,
+}
+
+fn logging(cfg: &Config, verbose: bool, to: LogTo) -> Result<LogGuard> {
     let dir = cfg.log_dir();
     logs::init(LogSetup {
-        dir: files.then_some(dir.as_path()),
+        dir: to.files.then_some(dir.as_path()),
         level: if verbose { "debug" } else { cfg.logs.level.as_filter() },
         keep_days: cfg.logs.keep_days,
-        console,
+        console: to.console,
     })
 }
 
@@ -471,7 +485,14 @@ async fn shutdown_signal() {
 
 fn run(config: &Path, pipelines: Vec<String>, dry_run: bool, verbose: bool) -> Result<ExitCode> {
     let cfg = load(config)?;
-    let _logs = logging(&cfg, verbose, true, !dry_run)?;
+    let _logs = logging(
+        &cfg,
+        verbose,
+        LogTo {
+            console: true,
+            files: !dry_run,
+        },
+    )?;
     let reports = runtime()?.block_on(async move {
         let agent = Agent::open(
             cfg,
@@ -491,28 +512,38 @@ fn run(config: &Path, pipelines: Vec<String>, dry_run: bool, verbose: bool) -> R
     })
 }
 
-/// `ferry watch` until `stop` (the Windows service's entry point too).
-pub fn serve(config: &Path, stop: CancellationToken, console: bool) -> Result<()> {
-    serve_with(config, stop, console, false, false, None)
-}
-
-fn serve_with(
-    config: &Path,
-    stop: CancellationToken,
+/// How `ferry watch` runs. The default is as a service: no console, and its
+/// manager, not a signal, stops it.
+#[derive(Default)]
+struct WatchOptions {
+    /// Log to stderr as well as to files.
     console: bool,
     verbose: bool,
+    /// Stop on Ctrl-C or SIGTERM.
     signals: bool,
+    /// `--metrics`, in place of the config's `metrics.listen`.
     metrics: Option<String>,
-) -> Result<()> {
+}
+
+/// `ferry watch` as the Windows service runs it, until `stop`.
+pub fn serve(config: &Path, stop: CancellationToken) -> Result<()> {
+    serve_with(config, stop, WatchOptions::default())
+}
+
+fn serve_with(config: &Path, stop: CancellationToken, options: WatchOptions) -> Result<()> {
     let mut cfg = load(config)?;
-    if let Some(listen) = metrics {
+    if let Some(listen) = options.metrics {
         crate::config::listen_address(&listen).context("--metrics")?;
         cfg.metrics = Some(crate::config::MetricsConfig { listen });
     }
-    let _logs = logging(&cfg, verbose, console, true)?;
+    let to = LogTo {
+        console: options.console,
+        files: true,
+    };
+    let _logs = logging(&cfg, options.verbose, to)?;
     runtime()?.block_on(async move {
         let agent = Arc::new(Agent::open(cfg, AgentOptions::default())?);
-        if signals {
+        if options.signals {
             stop_on_signals(stop.clone());
         }
         agent.watch(stop).await

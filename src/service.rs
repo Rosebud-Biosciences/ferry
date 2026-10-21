@@ -515,7 +515,7 @@ mod windows {
             })
         };
         report(ServiceState::Running, 0, Duration::ZERO)?;
-        let outcome = crate::cli::serve(config, stop.clone(), false);
+        let outcome = crate::cli::serve(config, stop.clone());
         report(ServiceState::StopPending, 0, Duration::from_secs(60))?;
         // A non-zero exit makes the service manager apply the restart actions.
         let code = if outcome.is_ok() { 0 } else { 1 };
