@@ -363,7 +363,7 @@ mod tests {
             crate::hooks::exec_hook(
                 "catalog".into(),
                 &argv,
-                &None,
+                None,
                 &Default::default(),
                 std::time::Duration::from_secs(30),
             )

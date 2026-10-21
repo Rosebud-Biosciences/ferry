@@ -150,7 +150,7 @@ impl Agent {
             .filter_map(|h| {
                 h.exec
                     .as_ref()
-                    .map(|argv| exec_hook(h.key(), argv, &h.cwd, &h.env, h.timeout))
+                    .map(|argv| exec_hook(h.key(), argv, h.cwd.as_deref(), &h.env, h.timeout))
             })
             .collect();
         Ok(Self {

@@ -3,7 +3,7 @@
 //! at and the URI that prefix is shown (and registered) as.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -234,8 +234,13 @@ fn aws_profile(profile: &str) -> Result<Credentials> {
     let config_path = std::env::var_os("AWS_CONFIG_FILE")
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".aws").join("config"));
-    let creds = ini_sections(&std::fs::read_to_string(&creds_path).unwrap_or_default());
-    let config = ini_sections(&std::fs::read_to_string(&config_path).unwrap_or_default());
+    profile_in(profile, &creds_path, &config_path)
+}
+
+/// `profile`'s keys, from the AWS credentials and config files at these paths.
+fn profile_in(profile: &str, creds_path: &Path, config_path: &Path) -> Result<Credentials> {
+    let creds = ini_sections(&std::fs::read_to_string(creds_path).unwrap_or_default());
+    let config = ini_sections(&std::fs::read_to_string(config_path).unwrap_or_default());
     let config_section = if profile == "default" {
         config.get("default")
     } else {
@@ -333,16 +338,7 @@ mod tests {
         let config = dir.path().join("config");
         std::fs::write(&creds, "[lab]\naws_access_key_id = AK\naws_secret_access_key = SK\n").unwrap();
         std::fs::write(&config, "[profile lab]\nregion = us-west-2\n").unwrap();
-        // SAFETY: tests touching these variables do not run concurrently with other readers.
-        unsafe {
-            std::env::set_var("AWS_SHARED_CREDENTIALS_FILE", &creds);
-            std::env::set_var("AWS_CONFIG_FILE", &config);
-        }
-        let found = aws_profile("lab").unwrap();
-        unsafe {
-            std::env::remove_var("AWS_SHARED_CREDENTIALS_FILE");
-            std::env::remove_var("AWS_CONFIG_FILE");
-        }
+        let found = profile_in("lab", &creds, &config).unwrap();
         assert_eq!(
             (found.access_key_id.as_str(), found.secret_access_key.as_str()),
             ("AK", "SK")

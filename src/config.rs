@@ -179,14 +179,16 @@ where
     d.deserialize_any(V(PhantomData))
 }
 
-macro_rules! shorthand_vec {
-    ($name:ident, $ty:ty) => {
-        fn $name<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<$ty>, D::Error> {
-            #[derive(Deserialize)]
-            struct Wrap(#[serde(deserialize_with = "string_or_struct")] $ty);
-            Ok(Vec::<Wrap>::deserialize(d)?.into_iter().map(|w| w.0).collect())
-        }
-    };
+/// A list whose items may each be [`string_or_struct`] shorthand.
+fn shorthand_vec<'de, T, D>(d: D) -> Result<Vec<T>, D::Error>
+where
+    T: Deserialize<'de> + FromStr<Err = String>,
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(bound(deserialize = "T: Deserialize<'de> + FromStr<Err = String>"))]
+    struct Wrap<T>(#[serde(deserialize_with = "string_or_struct")] T);
+    Ok(Vec::<Wrap<T>>::deserialize(d)?.into_iter().map(|w| w.0).collect())
 }
 
 // -- the schema ---------------------------------------------------------------
@@ -744,7 +746,7 @@ pub struct PipelineConfig {
     /// Key prefix under each destination's store (a destination may override it).
     #[serde(default)]
     pub prefix: String,
-    #[serde(deserialize_with = "de_destinations")]
+    #[serde(deserialize_with = "shorthand_vec")]
     pub destinations: Vec<DestinationConfig>,
     #[serde(default)]
     pub unit: UnitConfig,
@@ -786,7 +788,7 @@ pub struct PipelineConfig {
     pub limits: LimitsConfig,
     #[serde(default)]
     pub retry: RetryConfig,
-    #[serde(default, deserialize_with = "de_hooks")]
+    #[serde(default, deserialize_with = "shorthand_vec")]
     pub registrars: Vec<HookConfig>,
 }
 
@@ -812,7 +814,7 @@ pub struct ShipConfig {
     #[serde(default = "five_m_opt", deserialize_with = "de_opt_duration")]
     pub heartbeat: Option<Duration>,
     /// Exec hooks told about each day's log once it is shipped (`event: log`).
-    #[serde(default, deserialize_with = "de_hooks")]
+    #[serde(default, deserialize_with = "shorthand_vec")]
     pub registrars: Vec<HookConfig>,
 }
 
@@ -865,9 +867,6 @@ pub struct Config {
     pub notifiers: Vec<NotifierConfig>,
     pub metrics: Option<MetricsConfig>,
 }
-
-shorthand_vec!(de_destinations, DestinationConfig);
-shorthand_vec!(de_hooks, HookConfig);
 
 fn yes() -> bool {
     true

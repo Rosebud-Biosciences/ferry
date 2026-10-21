@@ -10,7 +10,7 @@
 //! with the end of stderr kept as the error.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -210,14 +210,14 @@ fn fill(template: &str, values: &[(&str, &str)]) -> String {
 pub fn exec_hook(
     name: String,
     argv: &[String],
-    cwd: &Option<PathBuf>,
+    cwd: Option<&Path>,
     env: &BTreeMap<String, String>,
     timeout: Duration,
 ) -> ExecHook {
     ExecHook {
         name,
         argv: argv.to_vec(),
-        cwd: cwd.clone(),
+        cwd: cwd.map(Path::to_path_buf),
         env: env.clone(),
         timeout,
     }
@@ -229,7 +229,7 @@ pub fn registrar_from(hook: &HookConfig, manifest_location: Option<Location>) ->
         return Ok(Arc::new(ExecRegistrar(exec_hook(
             name,
             argv,
-            &hook.cwd,
+            hook.cwd.as_deref(),
             &hook.env,
             hook.timeout,
         ))));
@@ -372,7 +372,7 @@ pub fn notifier_from(cfg: &NotifierConfig) -> Arc<dyn Notifier> {
             cfg.format.unwrap_or_default(),
         )),
         (None, Some(argv)) => Arc::new(ExecNotifier {
-            hook: exec_hook(cfg.key(), argv, &cfg.cwd, &cfg.env, cfg.timeout),
+            hook: exec_hook(cfg.key(), argv, cfg.cwd.as_deref(), &cfg.env, cfg.timeout),
             events: cfg.events.clone(),
             min_level: cfg.min_level,
         }),
@@ -594,7 +594,7 @@ mod tests {
             vec!["sh", "-c", unix]
         };
         let argv: Vec<String> = argv.into_iter().map(String::from).collect();
-        exec_hook("catalog".into(), &argv, &None, &env, timeout)
+        exec_hook("catalog".into(), &argv, None, &env, timeout)
     }
 
     fn event() -> Event {
