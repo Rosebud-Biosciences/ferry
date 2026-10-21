@@ -10,14 +10,15 @@
 //! with the end of stderr kept as the error.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use object_store::{ObjectStoreExt, PutPayload};
+use parking_lot::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// How much of a hook's stderr is kept (its end); errors show the last 2000
@@ -161,11 +162,10 @@ impl Registrar for ManifestRegistrar {
         }
         let manifest = event.manifest.as_ref().context("event without a manifest")?;
         let pipeline = event.pipeline.as_deref().unwrap_or_default();
-        let rel = self
-            .key
-            .replace("{unit}", &manifest.unit)
-            .replace("{pipeline}", pipeline)
-            .replace("{node}", &event.node);
+        let rel = fill(
+            &self.key,
+            &[("unit", &manifest.unit), ("pipeline", pipeline), ("node", &event.node)],
+        );
         let doc = ManifestDoc {
             schema: crate::manifest::MANIFEST_SCHEMA,
             agent: &event.agent,
@@ -183,17 +183,41 @@ impl Registrar for ManifestRegistrar {
     }
 }
 
+/// `template` with each `{name}` replaced by its value, in one pass: a value
+/// that itself holds a placeholder (a unit folder named `a{node}`) stays as
+/// it is. Braces that name no placeholder are kept.
+fn fill(template: &str, values: &[(&str, &str)]) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    'scan: while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..open]);
+        rest = &rest[open..];
+        for (name, value) in values {
+            let placeholder = format!("{{{name}}}");
+            if let Some(after) = rest.strip_prefix(placeholder.as_str()) {
+                out.push_str(value);
+                rest = after;
+                continue 'scan;
+            }
+        }
+        out.push('{');
+        rest = &rest[1..];
+    }
+    out.push_str(rest);
+    out
+}
+
 pub fn exec_hook(
     name: String,
     argv: &[String],
-    cwd: &Option<PathBuf>,
+    cwd: Option<&Path>,
     env: &BTreeMap<String, String>,
     timeout: Duration,
 ) -> ExecHook {
     ExecHook {
         name,
         argv: argv.to_vec(),
-        cwd: cwd.clone(),
+        cwd: cwd.map(Path::to_path_buf),
         env: env.clone(),
         timeout,
     }
@@ -205,7 +229,7 @@ pub fn registrar_from(hook: &HookConfig, manifest_location: Option<Location>) ->
         return Ok(Arc::new(ExecRegistrar(exec_hook(
             name,
             argv,
-            &hook.cwd,
+            hook.cwd.as_deref(),
             &hook.env,
             hook.timeout,
         ))));
@@ -348,7 +372,7 @@ pub fn notifier_from(cfg: &NotifierConfig) -> Arc<dyn Notifier> {
             cfg.format.unwrap_or_default(),
         )),
         (None, Some(argv)) => Arc::new(ExecNotifier {
-            hook: exec_hook(cfg.key(), argv, &cfg.cwd, &cfg.env, cfg.timeout),
+            hook: exec_hook(cfg.key(), argv, cfg.cwd.as_deref(), &cfg.env, cfg.timeout),
             events: cfg.events.clone(),
             min_level: cfg.min_level,
         }),
@@ -386,7 +410,8 @@ impl Alerts {
             Level::Warning => tracing::warn!(pipeline, unit, alert = true, "{}", alert.text()),
             Level::Error => tracing::error!(pipeline, unit, alert = true, "{}", alert.text()),
         }
-        if let Ok(mut sent) = self.sent.lock() {
+        {
+            let mut sent = self.sent.lock();
             if sent.len() >= SENT_KEPT {
                 sent.drain(..SENT_KEPT / 2);
             }
@@ -405,24 +430,19 @@ impl Alerts {
                     tracing::warn!("notifier failed: {e:#}");
                 }
             });
-            if let Ok(mut pending) = self.pending.lock() {
-                pending.retain(|h| !h.is_finished());
-                pending.push(handle);
-            }
+            let mut pending = self.pending.lock();
+            pending.retain(|h| !h.is_finished());
+            pending.push(handle);
         }
     }
 
     pub fn sent(&self) -> Vec<Alert> {
-        self.sent.lock().map(|s| s.clone()).unwrap_or_default()
+        self.sent.lock().clone()
     }
 
     /// Wait (briefly) for alerts still being delivered.
     pub async fn close(&self) {
-        let handles: Vec<_> = self
-            .pending
-            .lock()
-            .map(|mut p| p.drain(..).collect())
-            .unwrap_or_default();
+        let handles: Vec<_> = self.pending.lock().drain(..).collect();
         let _ = tokio::time::timeout(Duration::from_secs(15), futures::future::join_all(handles)).await;
     }
 }
@@ -434,6 +454,17 @@ mod notifier_tests {
 
     fn config(yaml: &str) -> NotifierConfig {
         yaml_serde::from_str(yaml).unwrap()
+    }
+
+    #[test]
+    fn manifest_keys_fill_each_placeholder_once() {
+        let values = [("unit", "plate{node}"), ("pipeline", "inst"), ("node", "pc1")];
+        assert_eq!(
+            fill("_manifests/{pipeline}/{unit}.json", &values),
+            "_manifests/inst/plate{node}.json"
+        );
+        assert_eq!(fill("{unit}/{node}/{x} {", &values), "plate{node}/pc1/{x} {");
+        assert_eq!(fill("plain", &values), "plain");
     }
 
     #[test]
@@ -563,7 +594,7 @@ mod tests {
             vec!["sh", "-c", unix]
         };
         let argv: Vec<String> = argv.into_iter().map(String::from).collect();
-        exec_hook("catalog".into(), &argv, &None, &env, timeout)
+        exec_hook("catalog".into(), &argv, None, &env, timeout)
     }
 
     fn event() -> Event {

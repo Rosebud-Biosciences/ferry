@@ -12,12 +12,13 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+use parking_lot::Mutex;
 use tokio::sync::{Notify, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
@@ -63,12 +64,12 @@ impl Shared {
     }
 
     fn take_hints(&self) -> (BTreeSet<String>, bool) {
-        let hinted = std::mem::take(&mut *self.hinted.lock().unwrap_or_else(|p| p.into_inner()));
+        let hinted = std::mem::take(&mut *self.hinted.lock());
         (hinted, self.discover.swap(false, Ordering::SeqCst))
     }
 
     fn has_hints(&self) -> bool {
-        self.discover.load(Ordering::SeqCst) || !self.hinted.lock().map(|h| h.is_empty()).unwrap_or(true)
+        self.discover.load(Ordering::SeqCst) || !self.hinted.lock().is_empty()
     }
 }
 
@@ -86,7 +87,7 @@ impl Drop for Claim {
         } else {
             &self.shared.queued
         };
-        set.lock().unwrap_or_else(|p| p.into_inner()).remove(&self.id);
+        set.lock().remove(&self.id);
         self.shared.poke();
     }
 }
@@ -199,7 +200,7 @@ fn spawn_upload(
     candidate: Candidate,
 ) {
     let id = candidate.file.id;
-    if !shared.queued.lock().unwrap_or_else(|p| p.into_inner()).insert(id) {
+    if !shared.queued.lock().insert(id) {
         return;
     }
     let claim = Claim {
@@ -234,12 +235,7 @@ fn spawn_finalize(
     stop: &CancellationToken,
     unit_id: i64,
 ) {
-    if !shared
-        .finalizing
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .insert(unit_id)
-    {
+    if !shared.finalizing.lock().insert(unit_id) {
         return;
     }
     let claim = Claim {
@@ -312,7 +308,7 @@ fn start_watcher(engine: &Engine, shared: Arc<Shared>) -> Option<RecommendedWatc
                 .join("/");
             match (!rel.is_empty()).then(|| layout.key_for(&rel)).flatten() {
                 Some(key) => {
-                    hints.hinted.lock().unwrap_or_else(|p| p.into_inner()).insert(key);
+                    hints.hinted.lock().insert(key);
                 }
                 // The root itself, or something above unit level: look for new units.
                 None => hints.discover.store(true, Ordering::SeqCst),

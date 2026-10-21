@@ -2,11 +2,12 @@
 
 use std::collections::BTreeMap;
 use std::future::Future;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
+use parking_lot::Mutex;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
@@ -149,7 +150,7 @@ impl Agent {
             .filter_map(|h| {
                 h.exec
                     .as_ref()
-                    .map(|argv| exec_hook(h.key(), argv, &h.cwd, &h.env, h.timeout))
+                    .map(|argv| exec_hook(h.key(), argv, h.cwd.as_deref(), &h.env, h.timeout))
             })
             .collect();
         Ok(Self {
@@ -296,7 +297,7 @@ impl Agent {
     }
 
     pub fn heartbeat(&self) -> serde_json::Value {
-        let journal = self.journal.lock().unwrap_or_else(|p| p.into_inner());
+        let journal = self.journal.lock();
         let pipelines: serde_json::Map<String, serde_json::Value> = self
             .engines
             .iter()

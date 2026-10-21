@@ -39,18 +39,6 @@ impl EventKind {
             Self::Receipt => "receipt",
         }
     }
-
-    pub fn parse(text: &str) -> Option<Self> {
-        Some(match text {
-            "register" => Self::Register,
-            "finalize" => Self::Finalize,
-            "failures" => Self::Failures,
-            "log" => Self::Log,
-            "alert" => Self::Alert,
-            "receipt" => Self::Receipt,
-            _ => return None,
-        })
-    }
 }
 
 /// One call to a hook. `id` is unique to the event, and a redelivery carries

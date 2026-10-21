@@ -8,10 +8,11 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
+use parking_lot::{Mutex, MutexGuard};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
@@ -23,16 +24,28 @@ use crate::journal::{Journal, Summary};
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_HEAD: usize = 8 * 1024;
 
-/// `(pipeline, destination, op, status)`.
-type TransferKey = (String, String, String, String);
+/// What the transfer counters are kept by.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct TransferKey {
+    pipeline: String,
+    destination: String,
+    op: String,
+    status: String,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct Tally {
+    count: i64,
+    bytes: i64,
+}
 
 /// A gauge per pipeline: its name, help, and value in a summary.
 type Gauge = (&'static str, &'static str, fn(&Summary) -> i64);
 
-/// Transfers counted so far: count and bytes by key, to the transfer `last`.
+/// Transfers counted so far, up to the transfer `last`.
 #[derive(Default)]
 struct Counted {
-    totals: BTreeMap<TransferKey, (i64, i64)>,
+    totals: BTreeMap<TransferKey, Tally>,
     last: i64,
 }
 
@@ -56,13 +69,13 @@ impl Metrics {
         }
     }
 
-    fn journal(&self) -> Result<std::sync::MutexGuard<'_, Journal>> {
-        self.journal.lock().map_err(|_| anyhow!("the journal lock is poisoned"))
+    fn journal(&self) -> MutexGuard<'_, Journal> {
+        self.journal.lock()
     }
 
     /// The journal answers.
     pub fn healthy(&self) -> Result<()> {
-        self.journal()?.get_meta("schema_version")?;
+        self.journal().get_meta("schema_version")?;
         Ok(())
     }
 
@@ -77,7 +90,7 @@ impl Metrics {
         );
         out.sample("ferry_start_time_seconds", &[], self.started);
 
-        let journal = self.journal()?;
+        let journal = self.journal();
         let mut summaries = Vec::new();
         for (name, dests) in &self.pipelines {
             summaries.push((name, journal.summary(name, dests)?));
@@ -130,12 +143,18 @@ impl Metrics {
             }
         }
 
-        let mut counted = self.transfers.lock().map_err(|_| anyhow!("metrics lock poisoned"))?;
+        let mut counted = self.transfers.lock();
         let (new, last) = journal.transfer_totals(counted.last)?;
         for t in new {
-            let entry = counted.totals.entry((t.pipeline, t.dest, t.op, t.status)).or_default();
-            entry.0 += t.count;
-            entry.1 += t.bytes;
+            let key = TransferKey {
+                pipeline: t.pipeline,
+                destination: t.dest,
+                op: t.op,
+                status: t.status,
+            };
+            let tally = counted.totals.entry(key).or_default();
+            tally.count += t.count;
+            tally.bytes += t.bytes;
         }
         counted.last = last;
         out.family(
@@ -143,16 +162,16 @@ impl Metrics {
             "counter",
             "Uploads, adoptions, moves and deletes, by outcome.",
         );
-        for ((pipeline, dest, op, status), (count, _)) in &counted.totals {
+        for (key, tally) in &counted.totals {
             out.sample(
                 "ferry_transfers_total",
                 &[
-                    ("pipeline", pipeline),
-                    ("destination", dest),
-                    ("op", op),
-                    ("status", status),
+                    ("pipeline", &key.pipeline),
+                    ("destination", &key.destination),
+                    ("op", &key.op),
+                    ("status", &key.status),
                 ],
-                *count as f64,
+                tally.count as f64,
             );
         }
         out.family(
@@ -160,12 +179,16 @@ impl Metrics {
             "counter",
             "Bytes uploaded, adopted, moved or deleted, by transfers that succeeded.",
         );
-        for ((pipeline, dest, op, status), (_, bytes)) in &counted.totals {
-            if status == "ok" {
+        for (key, tally) in &counted.totals {
+            if key.status == "ok" {
                 out.sample(
                     "ferry_transferred_bytes_total",
-                    &[("pipeline", pipeline), ("destination", dest), ("op", op)],
-                    *bytes as f64,
+                    &[
+                        ("pipeline", &key.pipeline),
+                        ("destination", &key.destination),
+                        ("op", &key.op),
+                    ],
+                    tally.bytes as f64,
                 );
             }
         }
@@ -293,8 +316,8 @@ mod tests {
     #[test]
     fn counters_add_up_across_scrapes() {
         let m = metrics();
-        upload(&m.journal().unwrap(), "inst", "ceph", "ok", 100);
-        upload(&m.journal().unwrap(), "inst", "ceph", "failed", 0);
+        upload(&m.journal(), "inst", "ceph", "ok", 100);
+        upload(&m.journal(), "inst", "ceph", "failed", 0);
         let first = m.render().unwrap();
         assert!(first.contains("ferry_build_info{version=\""), "{first}");
         assert!(first.contains("ferry_start_time_seconds 1700000000.5\n"), "{first}");
@@ -310,7 +333,7 @@ mod tests {
             "{first}"
         );
 
-        upload(&m.journal().unwrap(), "inst", "ceph", "ok", 50);
+        upload(&m.journal(), "inst", "ceph", "ok", 50);
         let second = m.render().unwrap();
         assert!(
             second.contains(

@@ -22,6 +22,7 @@ use crate::stores::{Location, open_stores};
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 
+#[derive(Default)]
 pub struct DoctorOptions {
     pub write: bool,
     pub notify: bool,

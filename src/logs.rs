@@ -6,13 +6,13 @@
 //! catalog as the node's logs.
 
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 
 use anyhow::{Context, Result};
 use aws_lc_rs::digest;
 use bytes::Bytes;
 use chrono::NaiveDate;
 use object_store::{ObjectStoreExt, PutPayload, WriteMultipart};
+use parking_lot::Mutex;
 use tokio::io::AsyncReadExt;
 use tracing_appender::non_blocking::{NonBlockingBuilder, WorkerGuard};
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
@@ -122,18 +122,16 @@ pub async fn ship_logs(
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let done = journal
-            .lock()
-            .map(|j| j.shipped(&name).unwrap_or(false))
-            .unwrap_or(true);
+        let done = journal.lock().shipped(&name).unwrap_or(false);
         if day >= today || done {
             continue;
         }
         match ship_one(location, node, &path, &name).await {
             Ok((uri, size, sha256)) => {
-                if let Ok(mut j) = journal.lock()
-                    && let Err(e) = j.record_shipped(&name, &uri, size as i64, &sha256, now_secs(), &names)
-                {
+                let recorded = journal
+                    .lock()
+                    .record_shipped(&name, &uri, size as i64, &sha256, now_secs(), &names);
+                if let Err(e) = recorded {
                     tracing::warn!("could not record shipping {name}: {e:#}");
                 }
                 tracing::info!("shipped log {name} to {uri}");
@@ -149,11 +147,7 @@ pub async fn ship_logs(
             Err(e) => tracing::warn!("could not ship {name}: {e:#}"),
         }
     }
-    let pending = journal
-        .lock()
-        .ok()
-        .and_then(|j| j.undelivered_logs(&names).ok())
-        .unwrap_or_default();
+    let pending = journal.lock().undelivered_logs(&names).unwrap_or_default();
     for (row, hook_name) in pending {
         let Some(hook) = hooks.iter().find(|h| h.name == hook_name) else {
             continue;
@@ -176,14 +170,15 @@ pub async fn ship_logs(
         event.id = log_event_id(&log);
         event.log = Some(log);
         let result = hook.run(&event).await;
-        if let Ok(j) = journal.lock() {
-            let recorded = match &result {
+        let recorded = {
+            let j = journal.lock();
+            match &result {
                 Ok(()) => j.log_delivered(&row.name, &hook_name, now_secs()),
                 Err(e) => j.log_delivery_failed(&row.name, &hook_name, &format!("{e:#}")),
-            };
-            if let Err(e) = recorded {
-                tracing::warn!("could not record telling {hook_name} about {}: {e:#}", row.name);
             }
+        };
+        if let Err(e) = recorded {
+            tracing::warn!("could not record telling {hook_name} about {}: {e:#}", row.name);
         }
         if let Err(e) = result {
             tracing::warn!(
@@ -368,7 +363,7 @@ mod tests {
             crate::hooks::exec_hook(
                 "catalog".into(),
                 &argv,
-                &None,
+                None,
                 &Default::default(),
                 std::time::Duration::from_secs(30),
             )

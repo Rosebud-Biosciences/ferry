@@ -21,12 +21,13 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 use futures::StreamExt;
 use futures::future::join_all;
 use object_store::{ObjectStore, ObjectStoreExt};
+use parking_lot::{Mutex, MutexGuard};
 use rusqlite::types::Value;
 use serde::Serialize;
 use tokio::sync::Semaphore;
@@ -45,7 +46,7 @@ use crate::manifest::{
 use crate::stores::Location;
 use crate::transfer::{self, Fanout as FanoutResult, ReadError, Target, UploadSettings};
 use crate::units::{Layout, held_path};
-use crate::util::{Clock, human_bytes, human_duration, iso};
+use crate::util::{Clock, Stats, human_bytes, human_duration, iso};
 use crate::winfs::held_open;
 
 /// One place a pipeline's files go.
@@ -202,11 +203,6 @@ async fn stat(path: &Path) -> Result<Option<std::fs::Metadata>> {
     }
 }
 
-/// The file still has the size and mtime the journal recorded.
-fn same_stats(meta: &std::fs::Metadata, file: &FileRow) -> bool {
-    (meta.len() as i64, crate::util::mtime_ns(meta)) == (file.size, file.mtime_ns)
-}
-
 /// The outbox's name for a notifier, kept apart from registrar names.
 fn receipt_key(notifier: &dyn Notifier) -> String {
     format!("notifier:{}", notifier.name())
@@ -268,7 +264,7 @@ impl Engine {
             .map(|d| d.key.clone())
             .collect();
         {
-            let mut journal = parts.journal.lock().map_err(|_| anyhow!("journal lock poisoned"))?;
+            let mut journal = parts.journal.lock();
             let moved = journal.bind_destinations(&parts.cfg.name, &parts.bindings, &all_keys)?;
             if !moved.is_empty() {
                 let pipeline = &parts.cfg.name;
@@ -330,7 +326,7 @@ impl Engine {
 
     // -- helpers ------------------------------------------------------------
     pub fn db(&self) -> MutexGuard<'_, Journal> {
-        self.journal.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.journal.lock()
     }
 
     fn now(&self) -> f64 {
@@ -349,9 +345,7 @@ impl Engine {
     }
 
     fn report<F: FnOnce(&mut PassReport)>(&self, f: F) {
-        if let Ok(mut report) = self.report.lock() {
-            f(&mut report);
-        }
+        f(&mut self.report.lock());
     }
 
     fn live(&self, unit_id: i64) -> Result<Vec<FileRow>> {
@@ -374,11 +368,7 @@ impl Engine {
     pub fn take_report(&self) -> PassReport {
         let now = self.now();
         let waiting = self.waiting().unwrap_or_default();
-        let mut report = self
-            .report
-            .lock()
-            .map(|mut r| std::mem::replace(&mut *r, PassReport::new(&self.name, now)))
-            .unwrap_or_else(|_| PassReport::new(&self.name, now));
+        let mut report = std::mem::replace(&mut *self.report.lock(), PassReport::new(&self.name, now));
         report.finished = Some(now);
         report.waiting = waiting;
         report
@@ -636,7 +626,7 @@ impl Engine {
                 verify: d.verify,
             })
             .collect();
-        let expect = Some((file.size as u64, file.mtime_ns));
+        let expect = Some(file.stats());
         let outcomes: Vec<(Vec<Target>, Result<FanoutResult, ReadError>)> = match self.cfg.fanout {
             Fanout::Shared => vec![(
                 targets.clone(),
@@ -912,7 +902,7 @@ impl Engine {
             None => {
                 let path = self.src(file);
                 let hashed = tokio::task::spawn_blocking(move || transfer::hash_file(&path)).await??;
-                if !hashed.steady_at((file.size as u64, file.mtime_ns)) {
+                if !hashed.steady_at(file.stats()) {
                     return Ok(false);
                 }
                 self.db().set_hash(file.id, &hashed.sha256, file.size, file.mtime_ns)?;
@@ -1443,7 +1433,7 @@ impl Engine {
         // the source must still be the bytes that were uploaded.
         if held_meta.is_none()
             && let Some(meta) = &src_meta
-            && !same_stats(meta, file)
+            && Stats::of(meta) != file.stats()
         {
             return Err(FinalizeError::Changed(
                 file.id,
@@ -1554,7 +1544,7 @@ impl Engine {
     /// SHA-256 (a rewrite can keep both).
     async fn held_mismatch(&self, held: &Path, file: &FileRow, action: Action) -> Result<Option<String>> {
         let meta = tokio::fs::metadata(held).await?;
-        if !same_stats(&meta, file) {
+        if Stats::of(&meta) != file.stats() {
             return Ok(Some("changed after it was uploaded".into()));
         }
         if action != Action::Delete {
@@ -1565,7 +1555,7 @@ impl Engine {
         };
         let path = held.to_path_buf();
         let hashed = tokio::task::spawn_blocking(move || transfer::hash_file(&path)).await??;
-        if !hashed.steady_at((file.size as u64, file.mtime_ns)) {
+        if !hashed.steady_at(file.stats()) {
             return Ok(Some("changed while it was checked".into()));
         }
         if hashed.sha256 != want {
