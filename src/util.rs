@@ -45,6 +45,23 @@ pub fn mtime_ns(meta: &Metadata) -> i64 {
         .unwrap_or(0)
 }
 
+/// A file's size and modification time: how ferry tells versions of a file
+/// apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Stats {
+    pub size: u64,
+    pub mtime_ns: i64,
+}
+
+impl Stats {
+    pub fn of(meta: &Metadata) -> Self {
+        Self {
+            size: meta.len(),
+            mtime_ns: mtime_ns(meta),
+        }
+    }
+}
+
 pub fn human_bytes(nbytes: u64) -> String {
     let mut value = nbytes as f64;
     for unit in ["B", "KB", "MB", "GB"] {

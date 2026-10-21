@@ -24,16 +24,28 @@ use crate::journal::{Journal, Summary};
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_HEAD: usize = 8 * 1024;
 
-/// `(pipeline, destination, op, status)`.
-type TransferKey = (String, String, String, String);
+/// What the transfer counters are kept by.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct TransferKey {
+    pipeline: String,
+    destination: String,
+    op: String,
+    status: String,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct Tally {
+    count: i64,
+    bytes: i64,
+}
 
 /// A gauge per pipeline: its name, help, and value in a summary.
 type Gauge = (&'static str, &'static str, fn(&Summary) -> i64);
 
-/// Transfers counted so far: count and bytes by key, to the transfer `last`.
+/// Transfers counted so far, up to the transfer `last`.
 #[derive(Default)]
 struct Counted {
-    totals: BTreeMap<TransferKey, (i64, i64)>,
+    totals: BTreeMap<TransferKey, Tally>,
     last: i64,
 }
 
@@ -134,9 +146,15 @@ impl Metrics {
         let mut counted = self.transfers.lock();
         let (new, last) = journal.transfer_totals(counted.last)?;
         for t in new {
-            let entry = counted.totals.entry((t.pipeline, t.dest, t.op, t.status)).or_default();
-            entry.0 += t.count;
-            entry.1 += t.bytes;
+            let key = TransferKey {
+                pipeline: t.pipeline,
+                destination: t.dest,
+                op: t.op,
+                status: t.status,
+            };
+            let tally = counted.totals.entry(key).or_default();
+            tally.count += t.count;
+            tally.bytes += t.bytes;
         }
         counted.last = last;
         out.family(
@@ -144,16 +162,16 @@ impl Metrics {
             "counter",
             "Uploads, adoptions, moves and deletes, by outcome.",
         );
-        for ((pipeline, dest, op, status), (count, _)) in &counted.totals {
+        for (key, tally) in &counted.totals {
             out.sample(
                 "ferry_transfers_total",
                 &[
-                    ("pipeline", pipeline),
-                    ("destination", dest),
-                    ("op", op),
-                    ("status", status),
+                    ("pipeline", &key.pipeline),
+                    ("destination", &key.destination),
+                    ("op", &key.op),
+                    ("status", &key.status),
                 ],
-                *count as f64,
+                tally.count as f64,
             );
         }
         out.family(
@@ -161,12 +179,16 @@ impl Metrics {
             "counter",
             "Bytes uploaded, adopted, moved or deleted, by transfers that succeeded.",
         );
-        for ((pipeline, dest, op, status), (_, bytes)) in &counted.totals {
-            if status == "ok" {
+        for (key, tally) in &counted.totals {
+            if key.status == "ok" {
                 out.sample(
                     "ferry_transferred_bytes_total",
-                    &[("pipeline", pipeline), ("destination", dest), ("op", op)],
-                    *bytes as f64,
+                    &[
+                        ("pipeline", &key.pipeline),
+                        ("destination", &key.destination),
+                        ("op", &key.op),
+                    ],
+                    tally.bytes as f64,
                 );
             }
         }

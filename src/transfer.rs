@@ -26,7 +26,7 @@ use tokio::sync::Mutex;
 
 use crate::config::{Bandwidth, Verify};
 use crate::stores::Location;
-use crate::util::mtime_ns;
+use crate::util::Stats;
 
 #[derive(Debug, Clone, Copy)]
 pub struct UploadSettings {
@@ -86,10 +86,6 @@ pub enum ReadError {
     Io(#[from] io::Error),
 }
 
-fn stats(meta: &fs::Metadata) -> (u64, i64) {
-    (meta.len(), mtime_ns(meta))
-}
-
 fn describe(e: impl std::fmt::Display) -> String {
     e.to_string()
 }
@@ -101,13 +97,13 @@ fn sha_hex(d: digest::Digest) -> String {
 /// Upload `path` to every target, reading it once.
 pub async fn upload(
     path: &Path,
-    expect: Option<(u64, i64)>,
+    expect: Option<Stats>,
     targets: &[Target],
     settings: &UploadSettings,
 ) -> Result<Fanout, ReadError> {
-    let before = tokio::fs::metadata(path).await?;
-    let (size, mtime) = stats(&before);
-    if expect.is_some_and(|e| e != (size, mtime)) {
+    let before = Stats::of(&tokio::fs::metadata(path).await?);
+    let size = before.size;
+    if expect.is_some_and(|e| e != before) {
         return Err(ReadError::Changed(format!(
             "{} changed since it was scanned",
             path.display()
@@ -120,8 +116,7 @@ pub async fn upload(
     } else {
         upload_single(path, targets).await?
     };
-    let after = tokio::fs::metadata(path).await?;
-    if stats(&after) != (size, mtime) {
+    if Stats::of(&tokio::fs::metadata(path).await?) != before {
         return Err(ReadError::Changed(format!(
             "{} changed while it was uploading",
             path.display()
@@ -141,7 +136,7 @@ pub async fn upload(
     results = checks;
     Ok(Fanout {
         size,
-        mtime_ns: mtime,
+        mtime_ns: before.mtime_ns,
         duration_ms: started.elapsed().as_millis() as u64,
         multipart,
         targets: targets
@@ -356,19 +351,19 @@ async fn verify(target: &Target, size: u64, sha256: &str) -> Result<Verify, Stri
 /// A local file's SHA-256, and its size and mtime before and after the read.
 pub struct Hashed {
     pub sha256: String,
-    pub before: (u64, i64),
-    pub after: (u64, i64),
+    pub before: Stats,
+    pub after: Stats,
 }
 
 impl Hashed {
-    /// The file had size and mtime `stats` throughout the read.
-    pub fn steady_at(&self, stats: (u64, i64)) -> bool {
+    /// The file had `stats` throughout the read.
+    pub fn steady_at(&self, stats: Stats) -> bool {
         self.before == stats && self.after == stats
     }
 }
 
 pub fn hash_file(path: &Path) -> io::Result<Hashed> {
-    let before = stats(&fs::metadata(path)?);
+    let before = Stats::of(&fs::metadata(path)?);
     let mut file = fs::File::open(path)?;
     let mut ctx = digest::Context::new(&digest::SHA256);
     let mut buf = vec![0u8; 1 << 20];
@@ -379,7 +374,7 @@ pub fn hash_file(path: &Path) -> io::Result<Hashed> {
         }
         ctx.update(&buf[..n]);
     }
-    let after = stats(&fs::metadata(path)?);
+    let after = Stats::of(&fs::metadata(path)?);
     Ok(Hashed {
         sha256: sha_hex(ctx.finish()),
         before,
@@ -623,7 +618,7 @@ mod tests {
         fs::write(&src, b"now").unwrap();
         let out = upload(
             &src,
-            Some((1, 1)),
+            Some(Stats { size: 1, mtime_ns: 1 }),
             &targets(&[&dir.path().join("a")], Verify::Size),
             &SMALL,
         )

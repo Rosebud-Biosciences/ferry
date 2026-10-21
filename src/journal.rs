@@ -27,6 +27,7 @@ use rusqlite::{Connection, OptionalExtension, Row, params, params_from_iter};
 use serde::Serialize;
 
 use crate::units::{Scan, UnitObs};
+use crate::util::Stats;
 
 pub const OPEN: &str = "open";
 pub const COMPLETE: &str = "complete";
@@ -239,6 +240,14 @@ pub struct FileRow {
 }
 
 impl FileRow {
+    /// The size and modification time the journal recorded.
+    pub fn stats(&self) -> Stats {
+        Stats {
+            size: self.size as u64,
+            mtime_ns: self.mtime_ns,
+        }
+    }
+
     fn from_row(r: &Row) -> rusqlite::Result<Self> {
         Ok(Self {
             id: r.get("id")?,
