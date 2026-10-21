@@ -8,6 +8,11 @@ here.
 
 ## [Unreleased]
 
+### Fixed
+
+- A unit whose folder name contains `{node}` or `{pipeline}` keeps it in its
+  manifest's key, instead of having it filled in like a placeholder.
+
 ## [0.1.0-alpha.1] - 2026-10-20
 
 The first release.

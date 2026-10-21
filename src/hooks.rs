@@ -161,11 +161,10 @@ impl Registrar for ManifestRegistrar {
         }
         let manifest = event.manifest.as_ref().context("event without a manifest")?;
         let pipeline = event.pipeline.as_deref().unwrap_or_default();
-        let rel = self
-            .key
-            .replace("{unit}", &manifest.unit)
-            .replace("{pipeline}", pipeline)
-            .replace("{node}", &event.node);
+        let rel = fill(
+            &self.key,
+            &[("unit", &manifest.unit), ("pipeline", pipeline), ("node", &event.node)],
+        );
         let doc = ManifestDoc {
             schema: crate::manifest::MANIFEST_SCHEMA,
             agent: &event.agent,
@@ -181,6 +180,30 @@ impl Registrar for ManifestRegistrar {
             .await?;
         Ok(())
     }
+}
+
+/// `template` with each `{name}` replaced by its value, in one pass: a value
+/// that itself holds a placeholder (a unit folder named `a{node}`) stays as
+/// it is. Braces that name no placeholder are kept.
+fn fill(template: &str, values: &[(&str, &str)]) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    'scan: while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..open]);
+        rest = &rest[open..];
+        for (name, value) in values {
+            let placeholder = format!("{{{name}}}");
+            if let Some(after) = rest.strip_prefix(placeholder.as_str()) {
+                out.push_str(value);
+                rest = after;
+                continue 'scan;
+            }
+        }
+        out.push('{');
+        rest = &rest[1..];
+    }
+    out.push_str(rest);
+    out
 }
 
 pub fn exec_hook(
@@ -434,6 +457,17 @@ mod notifier_tests {
 
     fn config(yaml: &str) -> NotifierConfig {
         yaml_serde::from_str(yaml).unwrap()
+    }
+
+    #[test]
+    fn manifest_keys_fill_each_placeholder_once() {
+        let values = [("unit", "plate{node}"), ("pipeline", "inst"), ("node", "pc1")];
+        assert_eq!(
+            fill("_manifests/{pipeline}/{unit}.json", &values),
+            "_manifests/inst/plate{node}.json"
+        );
+        assert_eq!(fill("{unit}/{node}/{x} {", &values), "plate{node}/pc1/{x} {");
+        assert_eq!(fill("plain", &values), "plain");
     }
 
     #[test]
