@@ -1,9 +1,14 @@
 version: 2
+# Every ecosystem waits 7 days after a release before proposing it, so a
+# hijacked upstream's malicious version is usually caught and yanked before it
+# lands here. Security updates ignore cooldown and still open immediately.
 updates:
   - package-ecosystem: cargo
     directory: /
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
     groups:
       crates:
         update-types: [minor, patch]
@@ -11,6 +16,8 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
     groups:
       actions:
         patterns: ["*"]
